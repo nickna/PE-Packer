@@ -1,0 +1,45 @@
+# Build results
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio cache/options
+.vs/
+.vscode/
+*.user
+*.userosscache
+*.sln.docstates
+
+# Rider
+.idea/
+*.sln.iml
+
+# User-specific files
+*.suo
+*.user
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# NuGet
+*.nupkg
+*.snupkg
+nupkg/
+packages/
+
+# Test Results
+TestResults/
+*.trx
+*.coverage
+
+# AI tools
+.claude/
+
+# BenchmarkDotNet
+BenchmarkDotNet.Artifacts/
