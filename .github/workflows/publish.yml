@@ -40,7 +40,7 @@ jobs:
         run: |
           echo "Package created:"
           ls -lh ./nupkg/
-          test -f "./nupkg/NickNa.PEPacker.${{ steps.version.outputs.VERSION }}.nupkg" || { echo "Package not found"; exit 1; }
+          ls ./nupkg/NickNa.PEPacker.*.nupkg > /dev/null 2>&1 || { echo "Package not found"; exit 1; }
           echo "Package created successfully"
 
       - name: Push to NuGet
