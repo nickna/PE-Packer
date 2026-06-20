@@ -217,13 +217,20 @@ public partial class AssemblyReferenceRewriter
             bodyOffset = CopyMethodBody(method);
         }
 
+        // ParamList must point at this method's first Param row. MetadataBuilder does
+        // not derive run-pointer columns (FieldList/MethodList are likewise assigned
+        // explicitly), so a nil here mis-links every method to the wrong Param rows —
+        // causing GetParameters() to throw BadImageFormatException at runtime. Hand it
+        // the current counter; param rows for this method are appended immediately below.
+        var firstParam = MetadataTokens.ParameterHandle(_nextParamRow);
+
         var newHandle = _metadata.AddMethodDefinition(
             method.Attributes,
             method.ImplAttributes,
             GetOrAddString(_reader.GetString(method.Name)),
             _metadata.GetOrAddBlob(newSignature),
             bodyOffset,
-            default); // Parameters added separately
+            firstParam);
 
         _methodDefMap[methodHandle] = newHandle;
 
@@ -233,7 +240,8 @@ public partial class AssemblyReferenceRewriter
             _targetEntryPoint = newHandle;
         }
 
-        // Copy parameters
+        // Copy parameters (including any return-value Param row at sequence 0),
+        // advancing the run-pointer counter for each row emitted.
         foreach (var paramHandle in method.GetParameters())
         {
             var param = _reader.GetParameter(paramHandle);
@@ -241,6 +249,7 @@ public partial class AssemblyReferenceRewriter
                 param.Attributes,
                 GetOrAddString(_reader.GetString(param.Name)),
                 param.SequenceNumber);
+            _nextParamRow++;
         }
 
         // Copy generic parameters

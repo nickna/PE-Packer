@@ -53,6 +53,13 @@ public partial class AssemblyReferenceRewriter : IDisposable
     // Method body offset tracking
     private readonly Dictionary<MethodDefinitionHandle, int> _methodBodyOffsets = new();
 
+    // Running 1-based Param table row counter. Each method's ParamList must point
+    // at its first Param row (run-indexed), so we hand the current value to
+    // AddMethodDefinition before appending that method's parameter rows. Methods are
+    // copied in MethodDef order with their Param rows emitted contiguously, so this
+    // yields correct, contiguous run-pointers (see CopyMethodDefinition).
+    private int _nextParamRow = 1;
+
     // Entry point from source
     private MethodDefinitionHandle _sourceEntryPoint;
     private MethodDefinitionHandle _targetEntryPoint;
