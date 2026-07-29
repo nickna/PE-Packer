@@ -110,6 +110,41 @@ public class MetadataRoundTripTests
         Assert.True(differences.Count == 0,
             $"{differences.Count} difference(s) after rewrite:{Environment.NewLine}  " +
             string.Join(Environment.NewLine + "  ", differences.Take(40)));
+
+        AssertNoVerificationErrorsIntroduced(source, rewritten);
+    }
+
+    /// <summary>
+    /// Runs ILVerify over both images and fails on findings the rewrite introduced.
+    /// </summary>
+    /// <remarks>
+    /// Compared against a baseline rather than asserted clean outright, because
+    /// PersistedAssemblyBuilder output is not guaranteed verifiable on its own — the point
+    /// is to isolate what the rewriter is responsible for. This catches what a metadata
+    /// diff cannot: a well-formed copy of ill-formed input still verifies the same, but a
+    /// copy that breaks a stack or handler invariant does not.
+    /// </remarks>
+    private static void AssertNoVerificationErrorsIntroduced(byte[] source, byte[] rewritten)
+    {
+        using var verifier = new ILVerifyHarness();
+
+        var before = verifier.Verify(source)
+            .GroupBy(finding => finding)
+            .ToDictionary(group => group.Key, group => group.Count());
+
+        var introduced = new List<string>();
+        foreach (var group in verifier.Verify(rewritten).GroupBy(finding => finding))
+        {
+            before.TryGetValue(group.Key, out int alreadyPresent);
+            for (int i = alreadyPresent; i < group.Count(); i++)
+            {
+                introduced.Add(group.Key);
+            }
+        }
+
+        Assert.True(introduced.Count == 0,
+            $"the rewrite introduced {introduced.Count} IL verification error(s):{Environment.NewLine}  " +
+            string.Join(Environment.NewLine + "  ", introduced.Take(30)));
     }
 
     // ---- fixtures -------------------------------------------------------------
