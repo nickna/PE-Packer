@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 
@@ -295,6 +296,152 @@ public partial class AssemblyReferenceRewriter
             var newHandle = _metadata.AddStandaloneSignature(_metadata.GetOrAddBlob(newSigBytes));
             _standAloneSigMap[sigHandle] = newHandle;
         }
+    }
+
+    /// <summary>
+    /// Copies the Property, PropertyMap, Event, EventMap and MethodSemantics tables.
+    /// </summary>
+    /// <remarks>
+    /// These were previously omitted entirely, so every property and event vanished from
+    /// the rewritten image: the <c>get_</c>/<c>set_</c> methods survived as ordinary
+    /// MethodDefs but nothing tied them together, and a referencing compiler saw no
+    /// properties at all.
+    /// </remarks>
+    private void CopyPropertiesAndEvents()
+    {
+        // MethodSemantics is sorted by its Association, a HasSemantics coded index
+        // (ECMA-335 II.24.2.6: Event = tag 0, Property = tag 1). That interleaves the two
+        // kinds by row number rather than grouping them, so rows are gathered here and
+        // emitted in coded-index order once every property and event has its handle.
+        var semantics = new List<(int Association, MethodSemanticsAttributes Attributes, MethodDefinitionHandle Method, EntityHandle Parent)>();
+
+        foreach (var typeDefHandle in _reader.TypeDefinitions)
+        {
+            var typeDef = _reader.GetTypeDefinition(typeDefHandle);
+            var newTypeDefHandle = _typeDefMap[typeDefHandle];
+
+            CopyProperties(typeDef, newTypeDefHandle, semantics);
+            CopyEvents(typeDef, newTypeDefHandle, semantics);
+        }
+
+        foreach (var entry in semantics.OrderBy(s => s.Association))
+        {
+            _metadata.AddMethodSemantics(entry.Parent, entry.Attributes, entry.Method);
+        }
+    }
+
+    private void CopyProperties(
+        TypeDefinition typeDef,
+        TypeDefinitionHandle newTypeDefHandle,
+        List<(int, MethodSemanticsAttributes, MethodDefinitionHandle, EntityHandle)> semantics)
+    {
+        var properties = typeDef.GetProperties();
+        if (properties.Count == 0)
+        {
+            return;
+        }
+
+        // PropertyMap.PropertyList is a run-pointer: it must name this type's first
+        // Property row, with the type's rows contiguous after it. MetadataBuilder does
+        // not derive it, exactly as with MethodDef.ParamList.
+        PropertyDefinitionHandle firstProperty = default;
+
+        foreach (var propertyHandle in properties)
+        {
+            var property = _reader.GetPropertyDefinition(propertyHandle);
+
+            // A PropertySig (II.23.2.5) is shaped like a method signature after its
+            // header: ParamCount, the property type, then any indexer parameters.
+            var newHandle = _metadata.AddProperty(
+                property.Attributes,
+                GetOrAddString(_reader.GetString(property.Name)),
+                _metadata.GetOrAddBlob(RewriteMethodOrFieldSignature(_reader.GetBlobReader(property.Signature))));
+
+            if (firstProperty.IsNil)
+            {
+                firstProperty = newHandle;
+            }
+
+            _propertyDefMap[propertyHandle] = newHandle;
+
+            var accessors = property.GetAccessors();
+            AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Getter, accessors.Getter);
+            AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Setter, accessors.Setter);
+            foreach (var other in accessors.Others)
+            {
+                AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Other, other);
+            }
+        }
+
+        _metadata.AddPropertyMap(newTypeDefHandle, firstProperty);
+    }
+
+    private void CopyEvents(
+        TypeDefinition typeDef,
+        TypeDefinitionHandle newTypeDefHandle,
+        List<(int, MethodSemanticsAttributes, MethodDefinitionHandle, EntityHandle)> semantics)
+    {
+        var events = typeDef.GetEvents();
+        if (events.Count == 0)
+        {
+            return;
+        }
+
+        EventDefinitionHandle firstEvent = default;
+
+        foreach (var eventHandle in events)
+        {
+            var eventDef = _reader.GetEventDefinition(eventHandle);
+
+            var newHandle = _metadata.AddEvent(
+                eventDef.Attributes,
+                GetOrAddString(_reader.GetString(eventDef.Name)),
+                MapEntityHandle(eventDef.Type));
+
+            if (firstEvent.IsNil)
+            {
+                firstEvent = newHandle;
+            }
+
+            _eventDefMap[eventHandle] = newHandle;
+
+            var accessors = eventDef.GetAccessors();
+            AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Adder, accessors.Adder);
+            AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Remover, accessors.Remover);
+            AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Raiser, accessors.Raiser);
+            foreach (var other in accessors.Others)
+            {
+                AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Other, other);
+            }
+        }
+
+        _metadata.AddEventMap(newTypeDefHandle, firstEvent);
+    }
+
+    private void AddSemantics(
+        List<(int, MethodSemanticsAttributes, MethodDefinitionHandle, EntityHandle)> semantics,
+        EntityHandle parent,
+        MethodSemanticsAttributes attributes,
+        MethodDefinitionHandle accessor)
+    {
+        if (accessor.IsNil)
+        {
+            return;
+        }
+
+        if (!_methodDefMap.TryGetValue(accessor, out var newAccessor))
+        {
+            throw new PEPackerException(
+                $"Accessor 0x{MetadataTokens.GetToken(accessor):X8} has no mapping; " +
+                "method handles must be created before properties and events are copied.");
+        }
+
+        // HasSemantics coded index (ECMA-335 II.24.2.6): (row << 1) | tag,
+        // where Event = 0 and Property = 1.
+        int tag = parent.Kind == HandleKind.EventDefinition ? 0 : 1;
+        int association = (MetadataTokens.GetRowNumber(parent) << 1) | tag;
+
+        semantics.Add((association, attributes, newAccessor, parent));
     }
 
     private void CopyCustomAttributes()

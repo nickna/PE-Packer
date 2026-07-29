@@ -42,6 +42,8 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private readonly Dictionary<MethodDefinitionHandle, MethodDefinitionHandle> _methodDefMap = new();
     private readonly Dictionary<FieldDefinitionHandle, FieldDefinitionHandle> _fieldDefMap = new();
     private readonly Dictionary<StandaloneSignatureHandle, StandaloneSignatureHandle> _standAloneSigMap = new();
+    private readonly Dictionary<PropertyDefinitionHandle, PropertyDefinitionHandle> _propertyDefMap = new();
+    private readonly Dictionary<EventDefinitionHandle, EventDefinitionHandle> _eventDefMap = new();
     private readonly Dictionary<UserStringHandle, UserStringHandle> _userStringMap = new();
     private readonly Dictionary<StringHandle, StringHandle> _stringHandleMap = new();
     private readonly Dictionary<GuidHandle, GuidHandle> _guidHandleMap = new();
@@ -196,7 +198,12 @@ public partial class AssemblyReferenceRewriter : IDisposable
         // Now has valid _methodSpecMap and _standAloneSigMap for IL token patching
         CopyMethodBodiesAndFinishTypes();
 
-        // Phase 12: Copy custom attributes
+        // Phase 12: Copy properties, events and their method semantics
+        // Must precede custom attributes so attributes parented to a property or
+        // event can be remapped rather than silently keeping a stale row number.
+        CopyPropertiesAndEvents();
+
+        // Phase 13: Copy custom attributes
         CopyCustomAttributes();
     }
 
@@ -212,18 +219,71 @@ public partial class AssemblyReferenceRewriter : IDisposable
             ? default
             : _methodDefMap.GetValueOrDefault(_sourceEntryPoint, default);
 
-        var peHeaderBuilder = PEHeaderBuilder.CreateExecutableHeader();
-
         var peBuilder = new ManagedPEBuilder(
-            peHeaderBuilder,
+            CreateHeaderFromSource(),
             metadataRootBuilder,
             _ilStream,
             mappedFieldData: _mappedFieldData.Count > 0 ? _mappedFieldData : null,
-            entryPoint: entryPoint);
+            strongNameSignatureSize: _peReader.PEHeaders.CorHeader?.StrongNameSignatureDirectory.Size ?? 128,
+            entryPoint: entryPoint,
+            flags: GetSourceCorFlags());
 
         var peBlob = new BlobBuilder();
         peBuilder.Serialize(peBlob);
         peBlob.WriteContentTo(output);
+    }
+
+    /// <summary>
+    /// Reproduces the source image's PE and COFF header fields.
+    /// </summary>
+    /// <remarks>
+    /// The rewriter previously used <see cref="PEHeaderBuilder.CreateExecutableHeader"/>
+    /// unconditionally, which stamps every output as a bare executable image — a library
+    /// came back without <see cref="Characteristics.Dll"/> — and discarded the source's
+    /// machine, subsystem, alignments and stack/heap reservations.
+    /// </remarks>
+    private PEHeaderBuilder CreateHeaderFromSource()
+    {
+        var coffHeader = _peReader.PEHeaders.CoffHeader;
+        var peHeader = _peReader.PEHeaders.PEHeader;
+
+        if (peHeader is null)
+        {
+            return PEHeaderBuilder.CreateExecutableHeader();
+        }
+
+        return new PEHeaderBuilder(
+            machine: coffHeader.Machine,
+            sectionAlignment: peHeader.SectionAlignment,
+            fileAlignment: peHeader.FileAlignment,
+            imageBase: peHeader.ImageBase,
+            majorLinkerVersion: peHeader.MajorLinkerVersion,
+            minorLinkerVersion: peHeader.MinorLinkerVersion,
+            majorOperatingSystemVersion: peHeader.MajorOperatingSystemVersion,
+            minorOperatingSystemVersion: peHeader.MinorOperatingSystemVersion,
+            majorImageVersion: peHeader.MajorImageVersion,
+            minorImageVersion: peHeader.MinorImageVersion,
+            majorSubsystemVersion: peHeader.MajorSubsystemVersion,
+            minorSubsystemVersion: peHeader.MinorSubsystemVersion,
+            subsystem: peHeader.Subsystem,
+            dllCharacteristics: peHeader.DllCharacteristics,
+            imageCharacteristics: coffHeader.Characteristics,
+            sizeOfStackReserve: peHeader.SizeOfStackReserve,
+            sizeOfStackCommit: peHeader.SizeOfStackCommit,
+            sizeOfHeapReserve: peHeader.SizeOfHeapReserve,
+            sizeOfHeapCommit: peHeader.SizeOfHeapCommit);
+    }
+
+    /// <summary>
+    /// Carries the source CLI header flags across, minus the strong-name bit: the
+    /// rewritten image is never re-signed, so claiming a signature would be a lie.
+    /// </summary>
+    private CorFlags GetSourceCorFlags()
+    {
+        var corHeader = _peReader.PEHeaders.CorHeader;
+        return corHeader is null
+            ? CorFlags.ILOnly
+            : corHeader.Flags & ~CorFlags.StrongNameSigned;
     }
 
     public void Dispose()

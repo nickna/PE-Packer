@@ -46,6 +46,12 @@ public partial class AssemblyReferenceRewriter
             HandleKind.AssemblyReference => _assemblyRefMap.GetValueOrDefault(
                 (AssemblyReferenceHandle)handle, (AssemblyReferenceHandle)handle),
 
+            HandleKind.PropertyDefinition => _propertyDefMap.GetValueOrDefault(
+                (PropertyDefinitionHandle)handle, (PropertyDefinitionHandle)handle),
+
+            HandleKind.EventDefinition => _eventDefMap.GetValueOrDefault(
+                (EventDefinitionHandle)handle, (EventDefinitionHandle)handle),
+
             _ => handle
         };
     }
