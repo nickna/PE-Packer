@@ -44,20 +44,15 @@ public partial class AssemblyReferenceRewriter
         // Patch metadata tokens in IL
         var patchedIL = PatchILTokens(ilBytes);
 
-        // Get local variables signature
+        // Get local variables signature. Every StandAloneSig row is copied up front
+        // (see CopyStandaloneSignatures), so a miss here means the phase order broke.
         StandaloneSignatureHandle localSig = default;
-        if (!body.LocalSignature.IsNil)
+        if (!body.LocalSignature.IsNil &&
+            !_standAloneSigMap.TryGetValue(body.LocalSignature, out localSig))
         {
-            localSig = _standAloneSigMap.GetValueOrDefault(body.LocalSignature, default);
-            if (localSig.IsNil)
-            {
-                // Copy the standalone signature now
-                var sig = _reader.GetStandaloneSignature(body.LocalSignature);
-                var reader = _reader.GetBlobReader(sig.Signature);
-                var newSigBytes = RewriteLocalVarsSignature(reader);
-                localSig = _metadata.AddStandaloneSignature(_metadata.GetOrAddBlob(newSigBytes));
-                _standAloneSigMap[body.LocalSignature] = localSig;
-            }
+            throw new PEPackerException(
+                $"Local variable signature 0x{MetadataTokens.GetToken(body.LocalSignature):X8} " +
+                "has no mapping; standalone signatures must be copied before method bodies.");
         }
 
         // Build method body by writing directly to the IL stream
@@ -219,6 +214,11 @@ public partial class AssemblyReferenceRewriter
         return methodBodyOffset;
     }
 
+    /// <summary>
+    /// Walks a method body and rewrites every metadata token operand in place.
+    /// Instruction lengths never change (tokens stay four bytes), so branch targets
+    /// and exception-handler offsets carry over untouched.
+    /// </summary>
     private byte[] PatchILTokens(byte[] ilBytes)
     {
         var result = new byte[ilBytes.Length];
@@ -227,140 +227,85 @@ public partial class AssemblyReferenceRewriter
         int offset = 0;
         while (offset < ilBytes.Length)
         {
+            int instructionStart = offset;
             byte opByte = ilBytes[offset++];
-            ILOpCode opcode;
 
-            if (opByte == 0xFE && offset < ilBytes.Length)
+            ILOperandKind kind;
+            if (opByte == ILOperandTable.ExtendedPrefix)
             {
-                // Two-byte opcode
-                opcode = (ILOpCode)(0xFE00 | ilBytes[offset++]);
-            }
-            else
-            {
-                opcode = (ILOpCode)opByte;
-            }
-
-            // Check if this opcode has a metadata token operand
-            if (HasMetadataTokenOperand(opcode))
-            {
-                if (offset + 4 <= ilBytes.Length)
+                if (offset >= ilBytes.Length)
                 {
-                    int token = BitConverter.ToInt32(ilBytes, offset);
-                    int newToken = MapMetadataToken(token);
-                    BitConverter.TryWriteBytes(result.AsSpan(offset), newToken);
+                    throw new PEPackerException(
+                        $"Method body ends mid-opcode: 0xFE prefix at IL offset {instructionStart}.");
                 }
-                offset += 4;
+                kind = ILOperandTable.GetExtended(ilBytes[offset++]);
             }
             else
             {
-                offset += GetOperandSize(opcode);
+                kind = ILOperandTable.Get(opByte);
+            }
+
+            switch (kind)
+            {
+                case ILOperandKind.None:
+                    break;
+
+                case ILOperandKind.Byte:
+                    offset += 1;
+                    break;
+
+                case ILOperandKind.Short:
+                    offset += 2;
+                    break;
+
+                case ILOperandKind.Int:
+                    offset += 4;
+                    break;
+
+                case ILOperandKind.Long:
+                    offset += 8;
+                    break;
+
+                case ILOperandKind.Token:
+                    RequireBytes(ilBytes, offset, 4, instructionStart);
+                    var token = BitConverter.ToInt32(ilBytes, offset);
+                    BitConverter.TryWriteBytes(result.AsSpan(offset), MapMetadataToken(token));
+                    offset += 4;
+                    break;
+
+                case ILOperandKind.Switch:
+                    // ECMA-335 III.3.66: a 4-byte case count, then that many 4-byte targets.
+                    RequireBytes(ilBytes, offset, 4, instructionStart);
+                    uint caseCount = BitConverter.ToUInt32(ilBytes, offset);
+                    offset += 4;
+                    long tableEnd = offset + ((long)caseCount * 4);
+                    if (tableEnd > ilBytes.Length)
+                    {
+                        throw new PEPackerException(
+                            $"switch at IL offset {instructionStart} declares {caseCount} cases, " +
+                            $"which overruns the {ilBytes.Length}-byte method body.");
+                    }
+                    offset = (int)tableEnd;
+                    break;
+
+                default:
+                    throw new PEPackerException(
+                        $"Undefined IL opcode 0x{(opByte == ILOperandTable.ExtendedPrefix ? 0xFE00 | ilBytes[offset - 1] : opByte):X2} " +
+                        $"at IL offset {instructionStart}; refusing to rewrite a method body the decoder cannot walk.");
             }
         }
 
         return result;
     }
 
-    private static bool HasMetadataTokenOperand(ILOpCode opcode)
+    private static void RequireBytes(byte[] ilBytes, int offset, int count, int instructionStart)
     {
-        return opcode switch
+        if (offset + count > ilBytes.Length)
         {
-            // Method tokens
-            ILOpCode.Call or ILOpCode.Callvirt or ILOpCode.Newobj or
-            ILOpCode.Ldftn or ILOpCode.Ldvirtftn or ILOpCode.Jmp => true,
-
-            // Field tokens
-            ILOpCode.Ldfld or ILOpCode.Stfld or ILOpCode.Ldsfld or
-            ILOpCode.Stsfld or ILOpCode.Ldflda or ILOpCode.Ldsflda => true,
-
-            // Type tokens
-            ILOpCode.Castclass or ILOpCode.Isinst or ILOpCode.Newarr or
-            ILOpCode.Box or ILOpCode.Unbox or ILOpCode.Unbox_any or
-            ILOpCode.Initobj or ILOpCode.Ldobj or ILOpCode.Stobj or
-            ILOpCode.Cpobj or ILOpCode.Sizeof or ILOpCode.Mkrefany or
-            ILOpCode.Refanyval or ILOpCode.Ldelema or ILOpCode.Constrained => true,
-
-            // Token tokens
-            ILOpCode.Ldtoken => true,
-
-            // String tokens
-            ILOpCode.Ldstr => true,
-
-            // Calli (standalone signature)
-            ILOpCode.Calli => true,
-
-            _ => false
-        };
-    }
-
-    private static int GetOperandSize(ILOpCode opcode)
-    {
-        return opcode switch
-        {
-            // No operand
-            ILOpCode.Nop or ILOpCode.Break or ILOpCode.Ldarg_0 or ILOpCode.Ldarg_1 or
-            ILOpCode.Ldarg_2 or ILOpCode.Ldarg_3 or ILOpCode.Ldloc_0 or ILOpCode.Ldloc_1 or
-            ILOpCode.Ldloc_2 or ILOpCode.Ldloc_3 or ILOpCode.Stloc_0 or ILOpCode.Stloc_1 or
-            ILOpCode.Stloc_2 or ILOpCode.Stloc_3 or ILOpCode.Ldnull or ILOpCode.Ldc_i4_m1 or
-            ILOpCode.Ldc_i4_0 or ILOpCode.Ldc_i4_1 or ILOpCode.Ldc_i4_2 or ILOpCode.Ldc_i4_3 or
-            ILOpCode.Ldc_i4_4 or ILOpCode.Ldc_i4_5 or ILOpCode.Ldc_i4_6 or ILOpCode.Ldc_i4_7 or
-            ILOpCode.Ldc_i4_8 or ILOpCode.Dup or ILOpCode.Pop or ILOpCode.Ret or
-            ILOpCode.Ldind_i1 or ILOpCode.Ldind_u1 or ILOpCode.Ldind_i2 or ILOpCode.Ldind_u2 or
-            ILOpCode.Ldind_i4 or ILOpCode.Ldind_u4 or ILOpCode.Ldind_i8 or ILOpCode.Ldind_i or
-            ILOpCode.Ldind_r4 or ILOpCode.Ldind_r8 or ILOpCode.Ldind_ref or ILOpCode.Stind_ref or
-            ILOpCode.Stind_i1 or ILOpCode.Stind_i2 or ILOpCode.Stind_i4 or ILOpCode.Stind_i8 or
-            ILOpCode.Stind_r4 or ILOpCode.Stind_r8 or ILOpCode.Add or ILOpCode.Sub or
-            ILOpCode.Mul or ILOpCode.Div or ILOpCode.Div_un or ILOpCode.Rem or ILOpCode.Rem_un or
-            ILOpCode.And or ILOpCode.Or or ILOpCode.Xor or ILOpCode.Shl or ILOpCode.Shr or
-            ILOpCode.Shr_un or ILOpCode.Neg or ILOpCode.Not or ILOpCode.Conv_i1 or
-            ILOpCode.Conv_i2 or ILOpCode.Conv_i4 or ILOpCode.Conv_i8 or ILOpCode.Conv_r4 or
-            ILOpCode.Conv_r8 or ILOpCode.Conv_u4 or ILOpCode.Conv_u8 or ILOpCode.Conv_r_un or
-            ILOpCode.Throw or ILOpCode.Conv_ovf_i1_un or ILOpCode.Conv_ovf_i2_un or
-            ILOpCode.Conv_ovf_i4_un or ILOpCode.Conv_ovf_i8_un or ILOpCode.Conv_ovf_u1_un or
-            ILOpCode.Conv_ovf_u2_un or ILOpCode.Conv_ovf_u4_un or ILOpCode.Conv_ovf_u8_un or
-            ILOpCode.Conv_ovf_i_un or ILOpCode.Conv_ovf_u_un or ILOpCode.Ldlen or
-            ILOpCode.Ldelem_i1 or ILOpCode.Ldelem_u1 or ILOpCode.Ldelem_i2 or ILOpCode.Ldelem_u2 or
-            ILOpCode.Ldelem_i4 or ILOpCode.Ldelem_u4 or ILOpCode.Ldelem_i8 or ILOpCode.Ldelem_i or
-            ILOpCode.Ldelem_r4 or ILOpCode.Ldelem_r8 or ILOpCode.Ldelem_ref or ILOpCode.Stelem_i or
-            ILOpCode.Stelem_i1 or ILOpCode.Stelem_i2 or ILOpCode.Stelem_i4 or ILOpCode.Stelem_i8 or
-            ILOpCode.Stelem_r4 or ILOpCode.Stelem_r8 or ILOpCode.Stelem_ref or ILOpCode.Conv_ovf_i1 or
-            ILOpCode.Conv_ovf_u1 or ILOpCode.Conv_ovf_i2 or ILOpCode.Conv_ovf_u2 or
-            ILOpCode.Conv_ovf_i4 or ILOpCode.Conv_ovf_u4 or ILOpCode.Conv_ovf_i8 or
-            ILOpCode.Conv_ovf_u8 or ILOpCode.Ckfinite or ILOpCode.Conv_u2 or ILOpCode.Conv_u1 or
-            ILOpCode.Conv_i or ILOpCode.Conv_ovf_i or ILOpCode.Conv_ovf_u or ILOpCode.Add_ovf or
-            ILOpCode.Add_ovf_un or ILOpCode.Mul_ovf or ILOpCode.Mul_ovf_un or ILOpCode.Sub_ovf or
-            ILOpCode.Sub_ovf_un or ILOpCode.Endfinally or ILOpCode.Stind_i or ILOpCode.Conv_u or
-            ILOpCode.Arglist or ILOpCode.Ceq or ILOpCode.Cgt or ILOpCode.Cgt_un or ILOpCode.Clt or
-            ILOpCode.Clt_un or ILOpCode.Localloc or ILOpCode.Endfilter or ILOpCode.Volatile or
-            ILOpCode.Tail or ILOpCode.Cpblk or ILOpCode.Initblk or ILOpCode.Rethrow or
-            ILOpCode.Refanytype or ILOpCode.Readonly => 0,
-
-            // 1-byte operand
-            ILOpCode.Ldarg_s or ILOpCode.Ldarga_s or ILOpCode.Starg_s or ILOpCode.Ldloc_s or
-            ILOpCode.Ldloca_s or ILOpCode.Stloc_s or ILOpCode.Ldc_i4_s or ILOpCode.Br_s or
-            ILOpCode.Brfalse_s or ILOpCode.Brtrue_s or ILOpCode.Beq_s or ILOpCode.Bge_s or
-            ILOpCode.Bgt_s or ILOpCode.Ble_s or ILOpCode.Blt_s or ILOpCode.Bne_un_s or
-            ILOpCode.Bge_un_s or ILOpCode.Bgt_un_s or ILOpCode.Ble_un_s or ILOpCode.Blt_un_s or
-            ILOpCode.Leave_s or ILOpCode.Unaligned => 1,
-
-            // 2-byte operand
-            ILOpCode.Ldarg or ILOpCode.Ldarga or ILOpCode.Starg or ILOpCode.Ldloc or
-            ILOpCode.Ldloca or ILOpCode.Stloc => 2,
-
-            // 4-byte operand (branch targets, integers, floats, tokens)
-            ILOpCode.Br or ILOpCode.Brfalse or ILOpCode.Brtrue or ILOpCode.Beq or
-            ILOpCode.Bge or ILOpCode.Bgt or ILOpCode.Ble or ILOpCode.Blt or ILOpCode.Bne_un or
-            ILOpCode.Bge_un or ILOpCode.Bgt_un or ILOpCode.Ble_un or ILOpCode.Blt_un or
-            ILOpCode.Leave or ILOpCode.Ldc_i4 or ILOpCode.Ldc_r4 => 4,
-
-            // 8-byte operand
-            ILOpCode.Ldc_i8 or ILOpCode.Ldc_r8 => 8,
-
-            // Variable-length (switch)
-            ILOpCode.Switch => 0, // Handled specially
-
-            // All token-based opcodes are 4 bytes (handled by HasMetadataTokenOperand)
-            _ => 0
-        };
+            throw new PEPackerException(
+                $"Method body ends mid-operand: instruction at IL offset {instructionStart} " +
+                $"needs {count} operand bytes but only {ilBytes.Length - offset} remain.");
+        }
     }
 
     private int MapMetadataToken(int token)
