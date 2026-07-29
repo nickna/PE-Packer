@@ -223,6 +223,26 @@ public partial class AssemblyReferenceRewriter
 
         _methodDefMap[methodHandle] = newHandle;
 
+        // P/Invoke target. ImplMap is sorted by MemberForwarded, and methods are copied
+        // in MethodDef order, so appending here keeps it sorted. Without this row the
+        // method keeps its PinvokeImpl flag but names no native entry point.
+        var import = method.GetImport();
+        if (!import.Module.IsNil)
+        {
+            if (!_moduleRefMap.TryGetValue(import.Module, out var newModule))
+            {
+                throw new PEPackerException(
+                    $"P/Invoke on '{_reader.GetString(method.Name)}' names module reference " +
+                    $"0x{MetadataTokens.GetToken(import.Module):X8}, which was not copied.");
+            }
+
+            _metadata.AddMethodImport(
+                newHandle,
+                import.Attributes,
+                GetOrAddString(_reader.GetString(import.Name)),
+                newModule);
+        }
+
         // Track entry point
         if (methodHandle == _sourceEntryPoint)
         {

@@ -44,6 +44,7 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private readonly Dictionary<StandaloneSignatureHandle, StandaloneSignatureHandle> _standAloneSigMap = new();
     private readonly Dictionary<PropertyDefinitionHandle, PropertyDefinitionHandle> _propertyDefMap = new();
     private readonly Dictionary<EventDefinitionHandle, EventDefinitionHandle> _eventDefMap = new();
+    private readonly Dictionary<ModuleReferenceHandle, ModuleReferenceHandle> _moduleRefMap = new();
 
     // Constant and FieldMarshal are sorted by a parent coded index that spans several
     // tables (HasConstant: Field, Param, Property; HasFieldMarshal: Field, Param), so a
@@ -160,8 +161,14 @@ public partial class AssemblyReferenceRewriter : IDisposable
     /// <summary>
     /// Rewrites the assembly references and saves to the output stream.
     /// </summary>
+    /// <exception cref="PEPackerException">
+    /// The source assembly uses metadata or PE features the rewriter does not reproduce.
+    /// </exception>
     public void Rewrite()
     {
+        // Phase 0: Refuse input we would only partially copy.
+        ValidateSupportedMetadata();
+
         // Phase 1: Copy assembly definition
         CopyAssemblyDefinition();
 
@@ -170,6 +177,11 @@ public partial class AssemblyReferenceRewriter : IDisposable
 
         // Phase 3: Create needed assembly references
         CreateAssemblyReferences();
+
+        // Phase 3b: Copy module references
+        // Must precede type references, whose resolution scope may name one, and method
+        // definitions, whose P/Invoke imports resolve through one.
+        CopyModuleReferences();
 
         // Phase 4: Copy type references with rewritten scopes
         CopyTypeReferences();

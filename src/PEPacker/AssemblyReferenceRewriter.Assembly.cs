@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
 
 namespace PEPacker;
 
@@ -28,6 +29,27 @@ public partial class AssemblyReferenceRewriter
             GetOrAddGuid(_reader.GetGuid(moduleDef.Mvid)),
             GetOrAddGuid(moduleDef.GenerationId.IsNil ? default : _reader.GetGuid(moduleDef.GenerationId)),
             GetOrAddGuid(moduleDef.BaseGenerationId.IsNil ? default : _reader.GetGuid(moduleDef.BaseGenerationId)));
+    }
+
+    /// <summary>
+    /// Copies the ModuleRef table in source order, preserving row numbering.
+    /// </summary>
+    /// <remarks>
+    /// ModuleRef names the native library behind a P/Invoke and can also serve as a
+    /// TypeRef resolution scope. It was previously not copied at all, so every
+    /// <c>DllImport</c> lost the library it pointed at.
+    /// </remarks>
+    private void CopyModuleReferences()
+    {
+        int moduleRefCount = _reader.GetTableRowCount(TableIndex.ModuleRef);
+        for (int row = 1; row <= moduleRefCount; row++)
+        {
+            var handle = MetadataTokens.ModuleReferenceHandle(row);
+            var moduleRef = _reader.GetModuleReference(handle);
+
+            _moduleRefMap[handle] = _metadata.AddModuleReference(
+                GetOrAddString(_reader.GetString(moduleRef.Name)));
+        }
     }
 
     private void CreateAssemblyReferences()

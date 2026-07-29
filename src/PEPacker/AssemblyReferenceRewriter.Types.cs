@@ -46,8 +46,24 @@ public partial class AssemblyReferenceRewriter
                     }
 
                 case HandleKind.ModuleReference:
+                    {
+                        // A nil scope means "search the ExportedType table" (ECMA-335
+                        // II.22.38), which is a different lookup entirely — so map the
+                        // reference rather than dropping it.
+                        var oldModuleRef = (ModuleReferenceHandle)typeRef.ResolutionScope;
+                        if (!_moduleRefMap.TryGetValue(oldModuleRef, out var newModuleRef))
+                        {
+                            throw new PEPackerException(
+                                $"Type reference '{fullName}' is scoped to module reference " +
+                                $"0x{MetadataTokens.GetToken(oldModuleRef):X8}, which was not copied.");
+                        }
+                        newResolutionScope = newModuleRef;
+                        break;
+                    }
+
                 case HandleKind.ModuleDefinition:
                 default:
+                    // Scoped to this module, or genuinely nil.
                     newResolutionScope = default;
                     break;
             }

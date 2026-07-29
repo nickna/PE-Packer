@@ -173,6 +173,62 @@ public class AssemblyReferenceRewriterMetadataTests
         });
     }
 
+    /// <summary>
+    /// P/Invoke declarations live in ImplMap, with ModuleRef naming the native library.
+    /// Neither was copied, so a rewritten <c>DllImport</c> kept its PinvokeImpl flag while
+    /// pointing at nothing. SharpTS emits these for its <c>fs</c> facade.
+    /// </summary>
+    [Fact]
+    public void Rewrite_PreservesPInvokeImports()
+    {
+        var source = Build("PInvokeFixture", module =>
+        {
+            var type = module.DefineType("Fixture.Native", TypeAttributes.Public);
+            var method = type.DefinePInvokeMethod(
+                "GetCurrentProcessId",
+                "kernel32.dll",
+                MethodAttributes.Public | MethodAttributes.Static | MethodAttributes.PinvokeImpl,
+                CallingConventions.Standard,
+                typeof(uint),
+                Type.EmptyTypes,
+                CallingConvention.Winapi,
+                CharSet.Auto);
+
+            // Without PreserveSig the CLR applies HRESULT translation and the native
+            // return value never reaches managed code, so the call would look broken
+            // whether or not the rewrite preserved it.
+            method.SetImplementationFlags(MethodImplAttributes.PreserveSig);
+            type.CreateType();
+        });
+
+        var rewritten = Rewrite(source);
+
+        var before = new PEReader(new MemoryStream(source)).GetMetadataReader();
+        var after = new PEReader(new MemoryStream(rewritten)).GetMetadataReader();
+        Assert.Equal(before.GetTableRowCount(TableIndex.ImplMap), after.GetTableRowCount(TableIndex.ImplMap));
+        Assert.Equal(before.GetTableRowCount(TableIndex.ModuleRef), after.GetTableRowCount(TableIndex.ModuleRef));
+
+        foreach (var handle in after.MethodDefinitions)
+        {
+            var method = after.GetMethodDefinition(handle);
+            if (after.GetString(method.Name) != "GetCurrentProcessId") continue;
+
+            var import = method.GetImport();
+            Assert.False(import.Module.IsNil);
+            Assert.Equal("GetCurrentProcessId", after.GetString(import.Name));
+            Assert.Equal("kernel32.dll", after.GetString(after.GetModuleReference(import.Module).Name));
+        }
+
+        if (!OperatingSystem.IsWindows()) return;
+
+        // The declaration has to survive well enough for the runtime to actually bind it.
+        Execute(rewritten, asm =>
+        {
+            var method = asm.GetType("Fixture.Native")!.GetMethod("GetCurrentProcessId")!;
+            Assert.Equal((uint)Environment.ProcessId, (uint)method.Invoke(null, null)!);
+        });
+    }
+
     [Fact]
     public void Rewrite_PreservesPEAndCorHeaderCharacteristics()
     {
