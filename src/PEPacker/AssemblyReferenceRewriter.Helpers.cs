@@ -15,39 +15,88 @@ public partial class AssemblyReferenceRewriter
         return string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
     }
 
+    /// <summary>
+    /// Translates a source handle into its counterpart in the assembly being built.
+    /// </summary>
+    /// <remarks>
+    /// Every mapped kind now fails on a miss. These lookups previously fell back to the
+    /// source handle, which silently kept the old row number — correct only while a table
+    /// happened to be copied in source order. That assumption is exactly what broke when
+    /// StandAloneSig rows were renumbered and <c>calli</c> followed a stale row into a
+    /// local-variable signature.
+    /// </remarks>
     private EntityHandle MapEntityHandle(EntityHandle handle)
     {
         if (handle.IsNil)
             return handle;
 
-        return handle.Kind switch
+        switch (handle.Kind)
         {
-            HandleKind.TypeReference => _typeRefMap.GetValueOrDefault(
-                (TypeReferenceHandle)handle, (TypeReferenceHandle)handle),
+            case HandleKind.TypeReference:
+                if (_typeRefMap.TryGetValue((TypeReferenceHandle)handle, out var typeRef)) return typeRef;
+                break;
 
-            HandleKind.TypeDefinition => _typeDefMap.GetValueOrDefault(
-                (TypeDefinitionHandle)handle, (TypeDefinitionHandle)handle),
+            case HandleKind.TypeDefinition:
+                if (_typeDefMap.TryGetValue((TypeDefinitionHandle)handle, out var typeDef)) return typeDef;
+                break;
 
-            HandleKind.TypeSpecification => _typeSpecMap.GetValueOrDefault(
-                (TypeSpecificationHandle)handle, (TypeSpecificationHandle)handle),
+            case HandleKind.TypeSpecification:
+                if (_typeSpecMap.TryGetValue((TypeSpecificationHandle)handle, out var typeSpec)) return typeSpec;
+                break;
 
-            HandleKind.MemberReference => _memberRefMap.GetValueOrDefault(
-                (MemberReferenceHandle)handle, (MemberReferenceHandle)handle),
+            case HandleKind.MemberReference:
+                if (_memberRefMap.TryGetValue((MemberReferenceHandle)handle, out var memberRef)) return memberRef;
+                break;
 
-            HandleKind.MethodDefinition => _methodDefMap.GetValueOrDefault(
-                (MethodDefinitionHandle)handle, (MethodDefinitionHandle)handle),
+            case HandleKind.MethodDefinition:
+                if (_methodDefMap.TryGetValue((MethodDefinitionHandle)handle, out var methodDef)) return methodDef;
+                break;
 
-            HandleKind.FieldDefinition => _fieldDefMap.GetValueOrDefault(
-                (FieldDefinitionHandle)handle, (FieldDefinitionHandle)handle),
+            case HandleKind.FieldDefinition:
+                if (_fieldDefMap.TryGetValue((FieldDefinitionHandle)handle, out var fieldDef)) return fieldDef;
+                break;
 
-            HandleKind.MethodSpecification => _methodSpecMap.GetValueOrDefault(
-                (MethodSpecificationHandle)handle, (MethodSpecificationHandle)handle),
+            case HandleKind.MethodSpecification:
+                if (_methodSpecMap.TryGetValue((MethodSpecificationHandle)handle, out var methodSpec)) return methodSpec;
+                break;
 
-            HandleKind.AssemblyReference => _assemblyRefMap.GetValueOrDefault(
-                (AssemblyReferenceHandle)handle, (AssemblyReferenceHandle)handle),
+            case HandleKind.AssemblyReference:
+                if (_assemblyRefMap.TryGetValue((AssemblyReferenceHandle)handle, out var assemblyRef)) return assemblyRef;
+                break;
 
-            _ => handle
-        };
+            case HandleKind.PropertyDefinition:
+                if (_propertyDefMap.TryGetValue((PropertyDefinitionHandle)handle, out var property)) return property;
+                break;
+
+            case HandleKind.EventDefinition:
+                if (_eventDefMap.TryGetValue((EventDefinitionHandle)handle, out var eventDef)) return eventDef;
+                break;
+
+            case HandleKind.ModuleReference:
+                if (_moduleRefMap.TryGetValue((ModuleReferenceHandle)handle, out var moduleRef)) return moduleRef;
+                break;
+
+            case HandleKind.GenericParameter:
+                if (_genericParamMap.TryGetValue((GenericParameterHandle)handle, out var genericParam)) return genericParam;
+                break;
+
+            // Single-row tables, and tables emitted strictly in source order, so their
+            // row numbers are unchanged by construction.
+            case HandleKind.AssemblyDefinition:
+            case HandleKind.ModuleDefinition:
+            case HandleKind.Parameter:
+            case HandleKind.InterfaceImplementation:
+                return handle;
+
+            default:
+                throw new PEPackerException(
+                    $"Handle kind '{handle.Kind}' (token 0x{MetadataTokens.GetToken(handle):X8}) " +
+                    "has no mapping; it cannot be carried into the rewritten assembly.");
+        }
+
+        throw new PEPackerException(
+            $"{handle.Kind} 0x{MetadataTokens.GetToken(handle):X8} was never copied, " +
+            "so it has no row in the rewritten assembly.");
     }
 
     private StringHandle GetOrAddString(string value)
@@ -95,7 +144,15 @@ public partial class AssemblyReferenceRewriter
             _ => 0
         };
 
-        public int GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind) => 0;
+        // Static initialized data is typed by a compiler-generated value type whose only
+        // size information is its ClassLayout. Returning 0 here made the field's RVA data
+        // look zero-length, and it was dropped without a word.
+        public int GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind)
+        {
+            var layout = reader.GetTypeDefinition(handle).GetLayout();
+            return layout.IsDefault ? 0 : layout.Size;
+        }
+
         public int GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind) => 0;
         public int GetTypeFromSpecification(MetadataReader reader, object? genericContext, TypeSpecificationHandle handle, byte rawTypeKind) => 0;
         public int GetSZArrayType(int elementType) => 0;

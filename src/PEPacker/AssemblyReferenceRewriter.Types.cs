@@ -46,8 +46,24 @@ public partial class AssemblyReferenceRewriter
                     }
 
                 case HandleKind.ModuleReference:
+                    {
+                        // A nil scope means "search the ExportedType table" (ECMA-335
+                        // II.22.38), which is a different lookup entirely — so map the
+                        // reference rather than dropping it.
+                        var oldModuleRef = (ModuleReferenceHandle)typeRef.ResolutionScope;
+                        if (!_moduleRefMap.TryGetValue(oldModuleRef, out var newModuleRef))
+                        {
+                            throw new PEPackerException(
+                                $"Type reference '{fullName}' is scoped to module reference " +
+                                $"0x{MetadataTokens.GetToken(oldModuleRef):X8}, which was not copied.");
+                        }
+                        newResolutionScope = newModuleRef;
+                        break;
+                    }
+
                 case HandleKind.ModuleDefinition:
                 default:
+                    // Scoped to this module, or genuinely nil.
                     newResolutionScope = default;
                     break;
             }
@@ -81,45 +97,56 @@ public partial class AssemblyReferenceRewriter
         }
     }
 
-    /// <summary>
-    /// First phase: pre-calculate all handles and create TypeDef entries.
-    /// This populates _typeDefMap, _fieldDefMap, and _methodDefMap.
-    /// Must run before CopyTypeSpecifications and CopyMethodSpecifications.
-    /// </summary>
-    private void CreateTypeDefinitionHandles()
-    {
-        var typeDefHandles = _reader.TypeDefinitions.ToList();
+    // Run-pointer starts, computed by PredictDefinitionHandles and consumed by
+    // AddTypeDefinitions once type specifications exist.
+    private readonly Dictionary<TypeDefinitionHandle, int> _typeFirstField = [];
+    private readonly Dictionary<TypeDefinitionHandle, int> _typeFirstMethod = [];
 
-        // First, pre-calculate field and method handles
-        // This is needed to set correct FieldList and MethodList in TypeDefs
+    /// <summary>
+    /// Assigns every TypeDef, Field and MethodDef its target row up front, without
+    /// emitting anything.
+    /// </summary>
+    /// <remarks>
+    /// These three tables are copied one-for-one in source order, so their target rows
+    /// are known in advance. Reserving them first breaks the cycle between type
+    /// definitions and type specifications: a TypeDef's base type may be a TypeSpec, and
+    /// a TypeSpec's signature may name a TypeDef, so neither can be emitted first.
+    /// Emitting TypeDefs before TypeSpecs existed used to leave the base-type lookup
+    /// unmapped, which went unnoticed only because the fallback returned the source
+    /// handle and the TypeSpec table happened to be numbered identically.
+    /// </remarks>
+    private void PredictDefinitionHandles()
+    {
+        int typeRow = 1;
         int fieldRow = 1;
         int methodRow = 1;
-        Dictionary<TypeDefinitionHandle, int> typeFirstField = [];
-        Dictionary<TypeDefinitionHandle, int> typeFirstMethod = [];
 
-        foreach (var typeDefHandle in typeDefHandles)
+        foreach (var typeDefHandle in _reader.TypeDefinitions)
         {
             var typeDef = _reader.GetTypeDefinition(typeDefHandle);
 
-            // Record first field/method for this type
-            typeFirstField[typeDefHandle] = fieldRow;
-            typeFirstMethod[typeDefHandle] = methodRow;
+            _typeDefMap[typeDefHandle] = MetadataTokens.TypeDefinitionHandle(typeRow++);
+            _typeFirstField[typeDefHandle] = fieldRow;
+            _typeFirstMethod[typeDefHandle] = methodRow;
 
-            // Pre-calculate field handles
             foreach (var fieldHandle in typeDef.GetFields())
             {
                 _fieldDefMap[fieldHandle] = MetadataTokens.FieldDefinitionHandle(fieldRow++);
             }
 
-            // Pre-calculate method handles
             foreach (var methodHandle in typeDef.GetMethods())
             {
                 _methodDefMap[methodHandle] = MetadataTokens.MethodDefinitionHandle(methodRow++);
             }
         }
+    }
 
-        // Now create TypeDef entries with correct FieldList and MethodList
-        foreach (var typeDefHandle in typeDefHandles)
+    /// <summary>
+    /// Emits the TypeDef rows reserved by <see cref="PredictDefinitionHandles"/>.
+    /// </summary>
+    private void AddTypeDefinitions()
+    {
+        foreach (var typeDefHandle in _reader.TypeDefinitions)
         {
             var typeDef = _reader.GetTypeDefinition(typeDefHandle);
 
@@ -128,20 +155,28 @@ public partial class AssemblyReferenceRewriter
                 GetOrAddString(_reader.GetString(typeDef.Namespace)),
                 GetOrAddString(_reader.GetString(typeDef.Name)),
                 MapEntityHandle(typeDef.BaseType),
-                MetadataTokens.FieldDefinitionHandle(typeFirstField[typeDefHandle]),
-                MetadataTokens.MethodDefinitionHandle(typeFirstMethod[typeDefHandle]));
+                MetadataTokens.FieldDefinitionHandle(_typeFirstField[typeDefHandle]),
+                MetadataTokens.MethodDefinitionHandle(_typeFirstMethod[typeDefHandle]));
 
-            _typeDefMap[typeDefHandle] = newHandle;
+            // Everything referring to this type already points at the reserved row.
+            if (newHandle != _typeDefMap[typeDefHandle])
+            {
+                throw new PEPackerException(
+                    $"Type '{_reader.GetString(typeDef.Name)}' landed at row " +
+                    $"{MetadataTokens.GetRowNumber(newHandle)} but was reserved at row " +
+                    $"{MetadataTokens.GetRowNumber(_typeDefMap[typeDefHandle])}.");
+            }
+
+            // ClassLayout carries explicit size and packing. Besides interop structs it
+            // is how static initialized data is declared, whose bytes FieldRVA already
+            // carries — copying one without the other describes the data with no type.
+            // The table is sorted by Parent, and types are emitted in order, so appending
+            // here keeps it sorted.
+            var layout = typeDef.GetLayout();
+            if (!layout.IsDefault)
+            {
+                _metadata.AddTypeLayout(newHandle, (ushort)layout.PackingSize, (uint)layout.Size);
+            }
         }
-    }
-
-    /// <summary>
-    /// Phase 6 is now a no-op since CreateTypeDefinitionHandles does all the work.
-    /// Kept for clarity in the phase ordering.
-    /// </summary>
-    private void CreateFieldAndMethodHandles()
-    {
-        // Field and method handles are now pre-calculated in CreateTypeDefinitionHandles
-        // to ensure correct FieldList and MethodList values in TypeDef entries.
     }
 }
