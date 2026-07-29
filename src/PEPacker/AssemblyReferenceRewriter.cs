@@ -44,6 +44,13 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private readonly Dictionary<StandaloneSignatureHandle, StandaloneSignatureHandle> _standAloneSigMap = new();
     private readonly Dictionary<PropertyDefinitionHandle, PropertyDefinitionHandle> _propertyDefMap = new();
     private readonly Dictionary<EventDefinitionHandle, EventDefinitionHandle> _eventDefMap = new();
+
+    // Constant and FieldMarshal are sorted by a parent coded index that spans several
+    // tables (HasConstant: Field, Param, Property; HasFieldMarshal: Field, Param), so a
+    // field row can sort after a property row. Rows are gathered while their owners are
+    // copied and emitted in coded-index order by EmitSortedConstantsAndMarshalDescriptors.
+    private readonly List<(int SortKey, EntityHandle Parent, object? Value)> _constants = [];
+    private readonly List<(int SortKey, EntityHandle Parent, BlobHandle Descriptor)> _marshalDescriptors = [];
     private readonly Dictionary<UserStringHandle, UserStringHandle> _userStringMap = new();
     private readonly Dictionary<StringHandle, StringHandle> _stringHandleMap = new();
     private readonly Dictionary<GuidHandle, GuidHandle> _guidHandleMap = new();
@@ -203,7 +210,11 @@ public partial class AssemblyReferenceRewriter : IDisposable
         // event can be remapped rather than silently keeping a stale row number.
         CopyPropertiesAndEvents();
 
-        // Phase 13: Copy custom attributes
+        // Phase 13: Emit the constants and marshalling descriptors gathered above,
+        // ordered by parent so both sorted tables stay searchable.
+        EmitSortedConstantsAndMarshalDescriptors();
+
+        // Phase 14: Copy custom attributes
         CopyCustomAttributes();
     }
 

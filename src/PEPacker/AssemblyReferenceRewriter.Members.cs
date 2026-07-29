@@ -163,20 +163,8 @@ public partial class AssemblyReferenceRewriter
             }
         }
 
-        // Copy default value if present
-        var defaultValue = field.GetDefaultValue();
-        if (!defaultValue.IsNil)
-        {
-            var constant = _reader.GetConstant(defaultValue);
-            _metadata.AddConstant(newHandle, constant.Value);
-        }
-
-        // Copy marshal info if present
-        var marshalInfo = field.GetMarshallingDescriptor();
-        if (!marshalInfo.IsNil)
-        {
-            _metadata.AddMarshallingDescriptor(newHandle, GetOrAddBlob(_reader.GetBlobBytes(marshalInfo)));
-        }
+        CollectConstant(field.GetDefaultValue(), newHandle);
+        CollectMarshallingDescriptor(field.GetMarshallingDescriptor(), newHandle);
 
         // Copy field layout if present
         var offset = field.GetOffset();
@@ -246,11 +234,17 @@ public partial class AssemblyReferenceRewriter
         foreach (var paramHandle in method.GetParameters())
         {
             var param = _reader.GetParameter(paramHandle);
-            _metadata.AddParameter(
+            var newParamHandle = _metadata.AddParameter(
                 param.Attributes,
                 GetOrAddString(_reader.GetString(param.Name)),
                 param.SequenceNumber);
             _nextParamRow++;
+
+            // Optional-parameter defaults live in the Constant table. Dropping them
+            // while keeping ParameterAttributes.HasDefault leaves the parameter
+            // claiming a default the metadata no longer carries.
+            CollectConstant(param.GetDefaultValue(), newParamHandle);
+            CollectMarshallingDescriptor(param.GetMarshallingDescriptor(), newParamHandle);
         }
 
         // Copy generic parameters
@@ -364,6 +358,8 @@ public partial class AssemblyReferenceRewriter
 
             _propertyDefMap[propertyHandle] = newHandle;
 
+            CollectConstant(property.GetDefaultValue(), newHandle);
+
             var accessors = property.GetAccessors();
             AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Getter, accessors.Getter);
             AddSemantics(semantics, newHandle, MethodSemanticsAttributes.Setter, accessors.Setter);
@@ -443,6 +439,96 @@ public partial class AssemblyReferenceRewriter
 
         semantics.Add((association, attributes, newAccessor, parent));
     }
+
+    /// <summary>
+    /// Records a Constant row for later emission, decoding the blob into the CLR value
+    /// <see cref="MetadataBuilder.AddConstant"/> expects.
+    /// </summary>
+    /// <remarks>
+    /// Handing that method the source <c>BlobHandle</c> instead throws
+    /// <c>ArgumentException: Value of type 'BlobHandle' is not a constant</c>, so any
+    /// assembly carrying a literal field or an optional parameter failed to rewrite.
+    /// </remarks>
+    private void CollectConstant(ConstantHandle constantHandle, EntityHandle newParent)
+    {
+        if (constantHandle.IsNil)
+        {
+            return;
+        }
+
+        var constant = _reader.GetConstant(constantHandle);
+        _constants.Add((HasConstantCodedIndex(newParent), newParent, DecodeConstantValue(constant)));
+    }
+
+    private void CollectMarshallingDescriptor(BlobHandle descriptor, EntityHandle newParent)
+    {
+        if (descriptor.IsNil)
+        {
+            return;
+        }
+
+        _marshalDescriptors.Add((
+            HasFieldMarshalCodedIndex(newParent),
+            newParent,
+            GetOrAddBlob(_reader.GetBlobBytes(descriptor))));
+    }
+
+    private void EmitSortedConstantsAndMarshalDescriptors()
+    {
+        foreach (var entry in _constants.OrderBy(c => c.SortKey))
+        {
+            _metadata.AddConstant(entry.Parent, entry.Value);
+        }
+
+        foreach (var entry in _marshalDescriptors.OrderBy(m => m.SortKey))
+        {
+            _metadata.AddMarshallingDescriptor(entry.Parent, entry.Descriptor);
+        }
+    }
+
+    private object? DecodeConstantValue(Constant constant)
+    {
+        var blob = _reader.GetBlobReader(constant.Value);
+
+        return constant.TypeCode switch
+        {
+            ConstantTypeCode.Boolean => blob.ReadBoolean(),
+            ConstantTypeCode.Char => blob.ReadChar(),
+            ConstantTypeCode.SByte => blob.ReadSByte(),
+            ConstantTypeCode.Byte => blob.ReadByte(),
+            ConstantTypeCode.Int16 => blob.ReadInt16(),
+            ConstantTypeCode.UInt16 => blob.ReadUInt16(),
+            ConstantTypeCode.Int32 => blob.ReadInt32(),
+            ConstantTypeCode.UInt32 => blob.ReadUInt32(),
+            ConstantTypeCode.Int64 => blob.ReadInt64(),
+            ConstantTypeCode.UInt64 => blob.ReadUInt64(),
+            ConstantTypeCode.Single => blob.ReadSingle(),
+            ConstantTypeCode.Double => blob.ReadDouble(),
+            ConstantTypeCode.String => blob.ReadUTF16(blob.RemainingBytes),
+            ConstantTypeCode.NullReference => null,
+            _ => throw new PEPackerException(
+                $"Unsupported constant type code '{constant.TypeCode}'.")
+        };
+    }
+
+    /// <summary>ECMA-335 II.24.2.6 HasConstant: Field = 0, Param = 1, Property = 2.</summary>
+    private static int HasConstantCodedIndex(EntityHandle parent) =>
+        (MetadataTokens.GetRowNumber(parent) << 2) | parent.Kind switch
+        {
+            HandleKind.FieldDefinition => 0,
+            HandleKind.Parameter => 1,
+            HandleKind.PropertyDefinition => 2,
+            _ => throw new PEPackerException($"'{parent.Kind}' cannot own a Constant row.")
+        };
+
+    /// <summary>ECMA-335 II.24.2.6 HasFieldMarshal: Field = 0, Param = 1.</summary>
+    private static int HasFieldMarshalCodedIndex(EntityHandle parent) =>
+        (MetadataTokens.GetRowNumber(parent) << 1) | parent.Kind switch
+        {
+            HandleKind.FieldDefinition => 0,
+            HandleKind.Parameter => 1,
+            _ => throw new PEPackerException($"'{parent.Kind}' cannot own a FieldMarshal row.")
+        };
 
     private void CopyCustomAttributes()
     {

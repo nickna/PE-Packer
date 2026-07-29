@@ -128,6 +128,51 @@ public class AssemblyReferenceRewriterMetadataTests
         });
     }
 
+    /// <summary>
+    /// The Constant table is sorted by a HasConstant coded index spanning Field (tag 0),
+    /// Param (tag 1) and Property (tag 2), so a low-row property sorts ahead of a
+    /// high-row field. The fixture puts the literal field at a high row and the property
+    /// constant at row 1 precisely so appending in copy order would come out unsorted —
+    /// and both MetadataReader and the runtime binary-search this table.
+    /// </summary>
+    [Fact]
+    public void Rewrite_PreservesConstants_AcrossFieldsParametersAndProperties()
+    {
+        var source = Build("ConstFixture", BuildConstantType);
+        var rewritten = Rewrite(source);
+
+        var before = new PEReader(new MemoryStream(source)).GetMetadataReader();
+        var after = new PEReader(new MemoryStream(rewritten)).GetMetadataReader();
+        Assert.Equal(before.GetTableRowCount(TableIndex.Constant), after.GetTableRowCount(TableIndex.Constant));
+
+        // Resolved through the binary search that an unsorted table would defeat.
+        foreach (var handle in after.PropertyDefinitions)
+        {
+            var property = after.GetPropertyDefinition(handle);
+            if (after.GetString(property.Name) != "Answer") continue;
+            Assert.False(property.GetDefaultValue().IsNil, "property constant did not resolve");
+        }
+
+        Execute(rewritten, asm =>
+        {
+            var type = asm.GetType("Fixture.Constants")!;
+
+            // Literal field: previously this threw during the rewrite itself, because
+            // AddConstant was handed a BlobHandle instead of the decoded value.
+            Assert.Equal(42, type.GetField("MaxValue")!.GetRawConstantValue());
+            Assert.Equal("tail", type.GetField("Suffix")!.GetRawConstantValue());
+
+            var method = type.GetMethod("WithOptional")!;
+            var parameters = method.GetParameters();
+            Assert.True(parameters[0].HasDefaultValue);
+            Assert.Equal(5, parameters[0].DefaultValue);
+            Assert.True(parameters[1].HasDefaultValue);
+            Assert.Equal("hi", parameters[1].DefaultValue);
+            Assert.True(parameters[2].HasDefaultValue);
+            Assert.Null(parameters[2].DefaultValue);
+        });
+    }
+
     [Fact]
     public void Rewrite_PreservesPEAndCorHeaderCharacteristics()
     {
@@ -206,6 +251,54 @@ public class AssemblyReferenceRewriterMetadataTests
         DefineProperty(type, "PropB", typeof(string), backing, withSetter: true);
         DefineEvent(type, "EventC");
         DefineProperty(type, "PropC", typeof(string), backing, withSetter: false);
+
+        type.CreateType();
+    }
+
+    private static void BuildConstantType(ModuleBuilder module)
+    {
+        var type = module.DefineType("Fixture.Constants", TypeAttributes.Public);
+
+        // Padding fields push the literal fields to high rows, so their HasConstant
+        // coded indices land after the property's despite being copied first.
+        for (int i = 0; i < 8; i++)
+        {
+            type.DefineField($"_pad{i}", typeof(int), FieldAttributes.Private);
+        }
+
+        var max = type.DefineField("MaxValue", typeof(int),
+            FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal);
+        max.SetConstant(42);
+
+        var suffix = type.DefineField("Suffix", typeof(string),
+            FieldAttributes.Public | FieldAttributes.Static | FieldAttributes.Literal);
+        suffix.SetConstant("tail");
+
+        var backing = type.DefineField("_answer", typeof(int), FieldAttributes.Private);
+
+        // Property constant — row 1, so it must sort ahead of the fields above.
+        var getter = type.DefineMethod("get_Answer",
+            MethodAttributes.Public | MethodAttributes.SpecialName, typeof(int), Type.EmptyTypes);
+        var getIl = getter.GetILGenerator();
+        getIl.Emit(OpCodes.Ldarg_0);
+        getIl.Emit(OpCodes.Ldfld, backing);
+        getIl.Emit(OpCodes.Ret);
+        var answer = type.DefineProperty("Answer", PropertyAttributes.HasDefault, typeof(int), Type.EmptyTypes);
+        answer.SetGetMethod(getter);
+        answer.SetConstant(7);
+
+        // Optional parameters — Param parents, tag 1, including a null default.
+        var method = type.DefineMethod("WithOptional", MethodAttributes.Public | MethodAttributes.Static,
+            typeof(string), [typeof(int), typeof(string), typeof(string)]);
+        method.DefineParameter(1, ParameterAttributes.Optional | ParameterAttributes.HasDefault, "count")
+            .SetConstant(5);
+        method.DefineParameter(2, ParameterAttributes.Optional | ParameterAttributes.HasDefault, "label")
+            .SetConstant("hi");
+        method.DefineParameter(3, ParameterAttributes.Optional | ParameterAttributes.HasDefault, "extra")
+            .SetConstant(null);
+        var il = method.GetILGenerator();
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Ret);
 
         type.CreateType();
     }
