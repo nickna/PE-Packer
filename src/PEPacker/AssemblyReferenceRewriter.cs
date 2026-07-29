@@ -185,12 +185,16 @@ public partial class AssemblyReferenceRewriter : IDisposable
         // Now has valid _typeDefMap and _methodDefMap entries
         CopyMethodSpecifications();
 
-        // Phase 10: Copy method bodies and finish type definition members
-        // Now has valid _methodSpecMap for IL token patching
-        CopyMethodBodiesAndFinishTypes();
-
-        // Phase 11: Copy standalone signatures
+        // Phase 10: Copy standalone signatures
+        // Must precede method bodies: `calli` operands are StandAloneSig tokens, so
+        // every row needs its final mapping before any IL is patched. Copying them
+        // on demand from CopyMethodBody instead renumbered the table (local-variable
+        // signatures landed first) and left calli pointing at a LocalVarSig row.
         CopyStandaloneSignatures();
+
+        // Phase 11: Copy method bodies and finish type definition members
+        // Now has valid _methodSpecMap and _standAloneSigMap for IL token patching
+        CopyMethodBodiesAndFinishTypes();
 
         // Phase 12: Copy custom attributes
         CopyCustomAttributes();

@@ -5,6 +5,12 @@ namespace PEPacker;
 
 public partial class AssemblyReferenceRewriter
 {
+    // ECMA-335 II.23.2.6 — LOCAL_SIG calling convention.
+    private const byte LocalVarSigCallingConvention = 0x07;
+
+    // ECMA-335 II.23.1.16 — ELEMENT_TYPE_SENTINEL.
+    private const int SentinelElementType = 0x41;
+
     #region Signature Rewriting
 
     private byte[] RewriteTypeSignature(BlobReader reader)
@@ -242,10 +248,21 @@ public partial class AssemblyReferenceRewriter
         // Return type
         RewriteTypeSignatureCore(ref reader, builder);
 
-        // Parameters
-        for (int i = 0; i < paramCount; i++)
+        // Parameters. A vararg signature places a SENTINEL before the extra arguments;
+        // ECMA-335 II.23.2.2 does not count it toward ParamCount, so pass it through
+        // without consuming a parameter slot.
+        int written = 0;
+        while (written < paramCount)
         {
+            var peek = reader;
+            if (reader.RemainingBytes > 0 && peek.ReadCompressedInteger() == SentinelElementType)
+            {
+                builder.WriteCompressedInteger(reader.ReadCompressedInteger());
+                continue;
+            }
+
             RewriteTypeSignatureCore(ref reader, builder);
+            written++;
         }
     }
 
@@ -288,6 +305,22 @@ public partial class AssemblyReferenceRewriter
         return builder.ToArray();
     }
 
+    /// <summary>
+    /// Rewrites a StandAloneSig blob. Row 0x07 is a LocalVarSig; every other calling
+    /// convention is a StandAloneMethodSig — the operand of <c>calli</c> — whose return
+    /// and parameter types carry tokens that need remapping just like any other signature.
+    /// </summary>
+    private byte[] RewriteStandaloneSignature(BlobReader reader)
+    {
+        if (reader.Length == 0)
+            return [];
+
+        var peek = reader;
+        return peek.ReadByte() == LocalVarSigCallingConvention
+            ? RewriteLocalVarsSignature(reader)
+            : RewriteMethodSignature(reader);
+    }
+
     private byte[] RewriteLocalVarsSignature(BlobReader reader)
     {
         if (reader.Length == 0)
@@ -298,7 +331,7 @@ public partial class AssemblyReferenceRewriter
         var header = reader.ReadByte();
         builder.WriteByte(header);
 
-        if (header != 0x07) // LOCAL_SIG
+        if (header != LocalVarSigCallingConvention)
         {
             // Not a local variables signature
             while (reader.RemainingBytes > 0)

@@ -278,19 +278,19 @@ public partial class AssemblyReferenceRewriter
         }
     }
 
+    /// <summary>
+    /// Copies every StandAloneSig row in source order, so the table keeps its row
+    /// numbering and both local-variable signatures and <c>calli</c> operands resolve.
+    /// </summary>
     private void CopyStandaloneSignatures()
     {
-        // Iterate through StandAloneSig table
         int sigCount = _reader.GetTableRowCount(TableIndex.StandAloneSig);
         for (int row = 1; row <= sigCount; row++)
         {
             var sigHandle = MetadataTokens.StandaloneSignatureHandle(row);
-            if (_standAloneSigMap.ContainsKey(sigHandle))
-                continue;
-
             var sig = _reader.GetStandaloneSignature(sigHandle);
             var reader = _reader.GetBlobReader(sig.Signature);
-            var newSigBytes = RewriteLocalVarsSignature(reader);
+            var newSigBytes = RewriteStandaloneSignature(reader);
 
             var newHandle = _metadata.AddStandaloneSignature(_metadata.GetOrAddBlob(newSigBytes));
             _standAloneSigMap[sigHandle] = newHandle;
