@@ -148,12 +148,12 @@ public partial class AssemblyReferenceRewriter
                 }
 
             default:
-                // Unknown type code - try to copy remaining bytes
-                while (reader.RemainingBytes > 0)
-                {
-                    builder.WriteByte(reader.ReadByte());
-                }
-                break;
+                // Copying the rest of the blob verbatim was a guess: an unrecognised
+                // element type means the walk has lost its place, and any type token
+                // still ahead would be carried over unmapped.
+                throw new PEPackerException(
+                    $"Unrecognised element type 0x{typeCode:X2} in a type signature; " +
+                    "the signature cannot be rewritten safely.");
         }
     }
 
@@ -163,18 +163,15 @@ public partial class AssemblyReferenceRewriter
         var tag = codedIndex & 0x3;
         var row = codedIndex >> 2;
 
+        // Each lookup fails rather than falling back to the source row: a coded index
+        // that silently keeps its old row number points at whatever now occupies it.
         EntityHandle newHandle = tag switch
         {
-            0 => _typeDefMap.GetValueOrDefault(
-                MetadataTokens.TypeDefinitionHandle(row),
-                MetadataTokens.TypeDefinitionHandle(row)),
-            1 => _typeRefMap.GetValueOrDefault(
-                MetadataTokens.TypeReferenceHandle(row),
-                MetadataTokens.TypeReferenceHandle(row)),
-            2 => _typeSpecMap.GetValueOrDefault(
-                MetadataTokens.TypeSpecificationHandle(row),
-                MetadataTokens.TypeSpecificationHandle(row)),
-            _ => default
+            0 => MapEntityHandle(MetadataTokens.TypeDefinitionHandle(row)),
+            1 => MapEntityHandle(MetadataTokens.TypeReferenceHandle(row)),
+            2 => MapEntityHandle(MetadataTokens.TypeSpecificationHandle(row)),
+            _ => throw new PEPackerException(
+                $"TypeDefOrRefOrSpec coded index 0x{codedIndex:X} has reserved tag {tag}.")
         };
 
         // Re-encode as coded index
@@ -184,7 +181,9 @@ public partial class AssemblyReferenceRewriter
             HandleKind.TypeDefinition => 0,
             HandleKind.TypeReference => 1,
             HandleKind.TypeSpecification => 2,
-            _ => tag
+            _ => throw new PEPackerException(
+                $"Mapping a TypeDefOrRefOrSpec produced a '{newHandle.Kind}' handle, " +
+                "which cannot be re-encoded.")
         };
 
         return (newRow << 2) | newTag;

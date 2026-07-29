@@ -27,6 +27,7 @@ public partial class AssemblyReferenceRewriter
         TableIndex.CustomAttribute,
         TableIndex.FieldMarshal,
         TableIndex.FieldLayout,
+        TableIndex.ClassLayout,
         TableIndex.StandAloneSig,
         TableIndex.EventMap,
         TableIndex.Event,
@@ -53,7 +54,6 @@ public partial class AssemblyReferenceRewriter
     private static string DescribeTable(TableIndex table) => table switch
     {
         TableIndex.DeclSecurity => "declarative security attributes",
-        TableIndex.ClassLayout => "explicit or sequential type layout",
         TableIndex.ModuleRef => "module references",
         TableIndex.ImplMap => "P/Invoke method definitions",
         TableIndex.File => "multi-file assembly manifests",

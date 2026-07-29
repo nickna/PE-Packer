@@ -132,7 +132,7 @@ public partial class AssemblyReferenceRewriter
 
             foreach (var genParamHandle in typeDef.GetGenericParameters())
             {
-                CopyGenericParameter(genParamHandle, newTypeDefHandle);
+                CollectGenericParameter(genParamHandle, newTypeDefHandle);
             }
         }
     }
@@ -150,17 +150,12 @@ public partial class AssemblyReferenceRewriter
 
         _fieldDefMap[fieldHandle] = newHandle;
 
-        // Copy field RVA if present (for field data)
+        // Copy field RVA data (static initialized data).
         var rva = field.GetRelativeVirtualAddress();
         if (rva != 0)
         {
-            // Get field data from the source PE
-            var fieldData = GetFieldData(rva, field);
-            if (fieldData.Length > 0)
-            {
-                _metadata.AddFieldRelativeVirtualAddress(newHandle, _mappedFieldData.Count);
-                _mappedFieldData.WriteBytes(fieldData);
-            }
+            _metadata.AddFieldRelativeVirtualAddress(newHandle, _mappedFieldData.Count);
+            _mappedFieldData.WriteBytes(GetFieldData(rva, field));
         }
 
         CollectConstant(field.GetDefaultValue(), newHandle);
@@ -174,23 +169,37 @@ public partial class AssemblyReferenceRewriter
         }
     }
 
+    /// <summary>
+    /// Reads a field's RVA data from the source image.
+    /// </summary>
+    /// <remarks>
+    /// This used to swallow every failure and return an empty array, and the caller then
+    /// skipped the FieldRVA row entirely — so an unrecognised field type silently cost the
+    /// data. Failing here is the honest outcome: the alternative is an assembly whose
+    /// static initializers quietly became empty.
+    /// </remarks>
     private byte[] GetFieldData(int rva, FieldDefinition field)
     {
+        int size;
         try
         {
-            // Get the size from the signature
-            var sig = field.DecodeSignature(new FieldDataSizeProvider(_reader), null);
-            if (sig > 0)
-            {
-                var sectionData = _peReader.GetSectionData(rva);
-                return sectionData.GetContent(0, sig).ToArray();
-            }
+            size = field.DecodeSignature(new FieldDataSizeProvider(_reader), null);
         }
-        catch
+        catch (Exception ex)
         {
-            // Failed to get field data size
+            throw new PEPackerException(
+                $"Could not decode the signature of field '{_reader.GetString(field.Name)}' " +
+                "to size its RVA data.", ex);
         }
-        return [];
+
+        if (size <= 0)
+        {
+            throw new PEPackerException(
+                $"Field '{_reader.GetString(field.Name)}' carries RVA data whose size could " +
+                "not be determined from its signature, so the data cannot be copied.");
+        }
+
+        return _peReader.GetSectionData(rva).GetContent(0, size).ToArray();
     }
 
     private void CopyMethodDefinition(MethodDefinitionHandle methodHandle)
@@ -270,28 +279,63 @@ public partial class AssemblyReferenceRewriter
         // Copy generic parameters
         foreach (var genParamHandle in method.GetGenericParameters())
         {
-            CopyGenericParameter(genParamHandle, newHandle);
+            CollectGenericParameter(genParamHandle, newHandle);
         }
     }
 
-    private void CopyGenericParameter(GenericParameterHandle genParamHandle, EntityHandle parent)
+    /// <summary>
+    /// Records a generic parameter for later emission in sorted order.
+    /// </summary>
+    /// <remarks>
+    /// Emitting these as they are encountered produced a GenericParam table sorted by
+    /// nothing in particular — method-owned rows were appended while copying methods and
+    /// type-owned rows afterwards, whereas the table must be ordered by the Owner coded
+    /// index, which interleaves the two kinds. MetadataBuilder rejects the result with
+    /// "Metadata table GenericParam not sorted" for some shapes and silently produces an
+    /// unsearchable table for others.
+    /// </remarks>
+    private void CollectGenericParameter(GenericParameterHandle genParamHandle, EntityHandle parent)
     {
-        var genParam = _reader.GetGenericParameter(genParamHandle);
+        _genericParameters.Add((TypeOrMethodDefCodedIndex(parent), parent, genParamHandle));
+    }
 
-        var newHandle = _metadata.AddGenericParameter(
-            parent,
-            genParam.Attributes,
-            GetOrAddString(_reader.GetString(genParam.Name)),
-            genParam.Index);
+    private void EmitSortedGenericParameters()
+    {
+        // Ordered by Owner, then by the parameter's own position within that owner.
+        var ordered = _genericParameters
+            .OrderBy(g => g.SortKey)
+            .ThenBy(g => _reader.GetGenericParameter(g.Source).Index);
 
-        // Copy constraints
-        foreach (var constraintHandle in genParam.GetConstraints())
+        foreach (var entry in ordered)
         {
-            var constraint = _reader.GetGenericParameterConstraint(constraintHandle);
-            var newConstraintType = MapEntityHandle(constraint.Type);
-            _metadata.AddGenericParameterConstraint(newHandle, newConstraintType);
+            var genParam = _reader.GetGenericParameter(entry.Source);
+
+            var newHandle = _metadata.AddGenericParameter(
+                entry.Parent,
+                genParam.Attributes,
+                GetOrAddString(_reader.GetString(genParam.Name)),
+                genParam.Index);
+
+            _genericParamMap[entry.Source] = newHandle;
+
+            // GenericParamConstraint is sorted by Owner too. Adding each parameter's
+            // constraints immediately keeps those owners ascending.
+            foreach (var constraintHandle in genParam.GetConstraints())
+            {
+                var constraint = _reader.GetGenericParameterConstraint(constraintHandle);
+                _metadata.AddGenericParameterConstraint(newHandle, MapEntityHandle(constraint.Type));
+            }
         }
     }
+
+    /// <summary>ECMA-335 II.24.2.6 TypeOrMethodDef: TypeDef = 0, MethodDef = 1.</summary>
+    private static int TypeOrMethodDefCodedIndex(EntityHandle owner) =>
+        (MetadataTokens.GetRowNumber(owner) << 1) | owner.Kind switch
+        {
+            HandleKind.TypeDefinition => 0,
+            HandleKind.MethodDefinition => 1,
+            _ => throw new PEPackerException($"'{owner.Kind}' cannot own a GenericParam row.")
+        };
 
     /// <summary>
     /// Copies every StandAloneSig row in source order, so the table keeps its row

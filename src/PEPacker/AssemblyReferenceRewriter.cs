@@ -45,6 +45,7 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private readonly Dictionary<PropertyDefinitionHandle, PropertyDefinitionHandle> _propertyDefMap = new();
     private readonly Dictionary<EventDefinitionHandle, EventDefinitionHandle> _eventDefMap = new();
     private readonly Dictionary<ModuleReferenceHandle, ModuleReferenceHandle> _moduleRefMap = new();
+    private readonly Dictionary<GenericParameterHandle, GenericParameterHandle> _genericParamMap = new();
 
     // Constant and FieldMarshal are sorted by a parent coded index that spans several
     // tables (HasConstant: Field, Param, Property; HasFieldMarshal: Field, Param), so a
@@ -52,6 +53,12 @@ public partial class AssemblyReferenceRewriter : IDisposable
     // copied and emitted in coded-index order by EmitSortedConstantsAndMarshalDescriptors.
     private readonly List<(int SortKey, EntityHandle Parent, object? Value)> _constants = [];
     private readonly List<(int SortKey, EntityHandle Parent, BlobHandle Descriptor)> _marshalDescriptors = [];
+
+    // GenericParam is sorted by (Owner, Number), where Owner is a TypeOrMethodDef coded
+    // index. Type-owned and method-owned rows therefore interleave by row number, and
+    // methods are copied before type generic parameters, so emission order is not sort
+    // order. Gathered here and emitted by EmitSortedGenericParameters.
+    private readonly List<(int SortKey, EntityHandle Parent, GenericParameterHandle Source)> _genericParameters = [];
     private readonly Dictionary<UserStringHandle, UserStringHandle> _userStringMap = new();
     private readonly Dictionary<StringHandle, StringHandle> _stringHandleMap = new();
     private readonly Dictionary<GuidHandle, GuidHandle> _guidHandleMap = new();
@@ -126,34 +133,56 @@ public partial class AssemblyReferenceRewriter : IDisposable
                 // Cache assembly info for later
                 _assemblyInfoCache[name] = asmName;
 
-                // Handle forwarded types
+                // Handle forwarded types. A facade routinely forwards to assemblies
+                // outside the probe directory; the exception still carries the entries
+                // that did resolve, so keep those instead of losing the whole facade.
+                Type?[] forwardedTypes;
                 try
                 {
-                    foreach (var forwardedType in asm.GetForwardedTypes())
-                    {
-                        if (forwardedType.FullName != null)
-                        {
-                            _typeToAssembly[forwardedType.FullName] = name;
-                        }
-                    }
+                    forwardedTypes = asm.GetForwardedTypes();
                 }
-                catch
+                catch (ReflectionTypeLoadException ex)
                 {
-                    // Some assemblies may not support GetForwardedTypes
+                    forwardedTypes = ex.Types;
                 }
 
-                // Map all public types
-                foreach (var type in asm.GetTypes())
+                foreach (var forwardedType in forwardedTypes)
                 {
-                    if ((type.IsPublic || type.IsNestedPublic) && type.FullName != null)
+                    if (forwardedType is { FullName: not null })
+                    {
+                        _typeToAssembly[forwardedType.FullName] = name;
+                    }
+                }
+
+                // Map all public types. A reference assembly may name types from
+                // assemblies outside the probe directory; ReflectionTypeLoadException
+                // still carries everything that did resolve, so take those rather than
+                // discarding the assembly's entire contribution.
+                Type?[] types;
+                try
+                {
+                    types = asm.GetTypes();
+                }
+                catch (ReflectionTypeLoadException ex)
+                {
+                    types = ex.Types;
+                }
+
+                foreach (var type in types)
+                {
+                    if (type is { FullName: not null } && (type.IsPublic || type.IsNestedPublic))
                     {
                         _typeToAssembly[type.FullName] = name;
                     }
                 }
             }
-            catch
+            catch (Exception ex) when (ex is BadImageFormatException or FileLoadException
+                                          or FileNotFoundException)
             {
-                // Skip assemblies that fail to load
+                // The probe directory holds native libraries alongside managed ones
+                // (clrjit, hostpolicy, ...), so these are expected and skipped. Anything
+                // else is a real fault and is left to propagate rather than degrading the
+                // type map without a word.
             }
         }
     }
@@ -186,18 +215,18 @@ public partial class AssemblyReferenceRewriter : IDisposable
         // Phase 4: Copy type references with rewritten scopes
         CopyTypeReferences();
 
-        // Phase 5: Create type definition handles (but not members yet)
-        // This populates _typeDefMap so that signatures can reference TypeDefs
-        CreateTypeDefinitionHandles();
+        // Phase 5: Reserve the target rows for every TypeDef, Field and MethodDef.
+        // Nothing is emitted yet; this only fixes the row numbers so the mutually
+        // dependent tables below can refer to each other.
+        PredictDefinitionHandles();
 
-        // Phase 6: Create field and method definition handles (but not bodies yet)
-        // This populates _fieldDefMap and _methodDefMap so that MethodSpecs
-        // can reference MethodDefs
-        CreateFieldAndMethodHandles();
-
-        // Phase 7: Copy type specifications (generic instantiations)
-        // Now has valid _typeDefMap entries
+        // Phase 6: Copy type specifications (generic instantiations)
+        // Their signatures may name TypeDefs, whose rows are now known.
         CopyTypeSpecifications();
+
+        // Phase 7: Emit the reserved TypeDef rows.
+        // A base type may be a TypeSpec, so this must follow phase 6.
+        AddTypeDefinitions();
 
         // Phase 8: Copy member references
         CopyMemberReferences();
@@ -222,8 +251,9 @@ public partial class AssemblyReferenceRewriter : IDisposable
         // event can be remapped rather than silently keeping a stale row number.
         CopyPropertiesAndEvents();
 
-        // Phase 13: Emit the constants and marshalling descriptors gathered above,
-        // ordered by parent so both sorted tables stay searchable.
+        // Phase 13: Emit the rows gathered above whose tables are sorted by a parent
+        // coded index, so copy order and emission order can differ.
+        EmitSortedGenericParameters();
         EmitSortedConstantsAndMarshalDescriptors();
 
         // Phase 14: Copy custom attributes

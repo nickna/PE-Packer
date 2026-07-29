@@ -1,5 +1,8 @@
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using PEPacker;
 using Xunit;
@@ -19,31 +22,41 @@ namespace PEPacker.Tests;
 public class AssemblyReferenceRewriterValidationTests
 {
     [Fact]
-    public void Rewrite_Rejects_ExplicitTypeLayout()
+    public void Rewrite_Rejects_ManifestResources()
     {
-        var source = Build("LayoutFixture", module => DefineExplicitLayoutStruct(module, "Fixture.Overlapped"));
+        // Reflection.Emit cannot produce a ManifestResource row, so the fixture is built
+        // straight from MetadataBuilder.
+        var source = BuildWithUnsupportedTables(addManifestResource: true, addExportedType: false);
 
         var ex = Assert.Throws<PEPackerException>(() => Rewrite(source));
-        Assert.Contains("ClassLayout", ex.Message);
-        Assert.Contains("explicit or sequential type layout", ex.Message);
+        Assert.Contains("ManifestResource", ex.Message);
+        Assert.Contains("embedded or linked managed resources", ex.Message);
         Assert.Contains("not a general-purpose PE round-tripper", ex.Message);
     }
 
     [Fact]
     public void Rewrite_ReportsEveryUnsupportedConstruct_NotJustTheFirst()
     {
-        var source = Build("MultiFixture", module =>
-        {
-            DefineExplicitLayoutStruct(module, "Fixture.Overlapped");
-            DefineExplicitLayoutStruct(module, "Fixture.AlsoOverlapped");
-        });
+        var source = BuildWithUnsupportedTables(addManifestResource: true, addExportedType: true);
 
         var ex = Assert.Throws<PEPackerException>(() => Rewrite(source));
 
         // One pass over the source should surface the whole list, so a caller fixes
         // everything at once instead of rediscovering it a table at a time.
-        Assert.Contains("ClassLayout (2 rows)", ex.Message);
-        Assert.Contains("explicit or sequential type layout", ex.Message);
+        Assert.Contains("ManifestResource", ex.Message);
+        Assert.Contains("ExportedType", ex.Message);
+        Assert.Contains("exported or forwarded types", ex.Message);
+    }
+
+    [Fact]
+    public void Rewrite_Accepts_ExplicitTypeLayout()
+    {
+        // ClassLayout is how static initialized data is declared as well as how interop
+        // structs are laid out, and FieldRVA already carries the bytes, so it is copied.
+        var source = Build("LayoutFixture", module => DefineExplicitLayoutStruct(module, "Fixture.Overlapped"));
+
+        var rewritten = Rewrite(source);
+        Assert.NotEmpty(rewritten);
     }
 
     [Fact]
@@ -104,6 +117,53 @@ public class AssemblyReferenceRewriterValidationTests
         type.DefineField("AsFloat", typeof(float), FieldAttributes.Public).SetOffset(0);
 
         type.CreateType();
+    }
+
+    /// <summary>
+    /// Hand-builds a minimal but well-formed assembly carrying tables Reflection.Emit
+    /// will not produce, so the guard can be tested against them directly.
+    /// </summary>
+    private static byte[] BuildWithUnsupportedTables(bool addManifestResource, bool addExportedType)
+    {
+        var metadata = new MetadataBuilder();
+
+        metadata.AddAssembly(
+            metadata.GetOrAddString("GuardFixture"), new Version(1, 0, 0, 0),
+            default, default, 0, AssemblyHashAlgorithm.Sha1);
+
+        metadata.AddModule(0, metadata.GetOrAddString("GuardFixture.dll"),
+            metadata.GetOrAddGuid(Guid.NewGuid()), default, default);
+
+        // The <Module> pseudo-type every assembly must define.
+        metadata.AddTypeDefinition(default, default, metadata.GetOrAddString("<Module>"),
+            default, MetadataTokens.FieldDefinitionHandle(1), MetadataTokens.MethodDefinitionHandle(1));
+
+        if (addManifestResource)
+        {
+            metadata.AddManifestResource(ManifestResourceAttributes.Public,
+                metadata.GetOrAddString("payload.bin"), default, offset: 0);
+        }
+
+        if (addExportedType)
+        {
+            // ExportedType's Implementation must name where the type actually lives.
+            var target = metadata.AddAssemblyReference(
+                metadata.GetOrAddString("Elsewhere"), new Version(1, 0, 0, 0),
+                default, default, 0, default);
+
+            metadata.AddExportedType(TypeAttributes.Public,
+                metadata.GetOrAddString("Ns"), metadata.GetOrAddString("Forwarded"),
+                target, 0);
+        }
+
+        var peBuilder = new ManagedPEBuilder(
+            PEHeaderBuilder.CreateLibraryHeader(),
+            new MetadataRootBuilder(metadata),
+            new BlobBuilder());
+
+        var blob = new BlobBuilder();
+        peBuilder.Serialize(blob);
+        return blob.ToArray();
     }
 
     private static byte[] Build(string name, Action<ModuleBuilder> emit)
