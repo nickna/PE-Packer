@@ -6,8 +6,14 @@ namespace PEPacker.Bundling;
 
 /// <summary>
 /// Creates single-file executables using manual byte-patching of the apphost template.
-/// This bundler works without requiring the .NET SDK to be installed.
 /// </summary>
+/// <remarks>
+/// This avoids the SDK's <c>Microsoft.NET.HostModel.dll</c>, which <see cref="SdkBundler"/>
+/// reflects into, so it stays usable when that library is missing. It does not remove the
+/// need for an SDK installation: the apphost template still comes from the
+/// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack under the dotnet root, and
+/// <see cref="CreateSingleFileExecutable"/> throws when that pack cannot be found.
+/// </remarks>
 public class ManualBundler : IBundler
 {
     // Bundle header placeholder (40 bytes total):
