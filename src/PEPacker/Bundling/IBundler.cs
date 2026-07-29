@@ -32,7 +32,9 @@ public enum BundleTechnique
     SdkBundler,
 
     /// <summary>
-    /// Used the built-in manual byte-patching bundler (no SDK required).
+    /// Used the built-in manual byte-patching bundler, which does not load the SDK's
+    /// Microsoft.NET.HostModel.dll. It still reads the apphost template from the installed
+    /// Microsoft.NETCore.App.Host.&lt;rid&gt; pack.
     /// </summary>
     ManualBundler
 }
