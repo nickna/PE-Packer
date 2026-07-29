@@ -54,6 +54,13 @@ internal static class MetadataDiffer
         {
             if (table == TableIndex.AssemblyRef) continue;
 
+            // A ClassLayout row of all zeros carries no information — ECMA-335 II.22.8
+            // has size 0 mean "compute from the fields" — and TypeLayout.IsDefault cannot
+            // tell such a row from an absent one, so the row count is not meaningful.
+            // CompareTypes checks each type's effective layout instead, which is stricter
+            // about the thing that matters.
+            if (table == TableIndex.ClassLayout) continue;
+
             int countA = a.GetTableRowCount(table);
             int countB = b.GetTableRowCount(table);
             if (countA != countB)
@@ -101,6 +108,7 @@ internal static class MetadataDiffer
             Check(differences, name, "name", FullName(a, typeA), FullName(b, typeB));
             Check(differences, name, "attributes", typeA.Attributes, typeB.Attributes);
             Check(differences, name, "base type", Describe(a, typeA.BaseType), Describe(b, typeB.BaseType));
+            Check(differences, name, "layout", DescribeLayout(typeA), DescribeLayout(typeB));
 
             Check(differences, name, "interfaces",
                 Join(typeA.GetInterfaceImplementations().Select(h => Describe(a, a.GetInterfaceImplementation(h).Interface))),
@@ -308,6 +316,12 @@ internal static class MetadataDiffer
     }
 
     // ---- describers -----------------------------------------------------------
+
+    private static string DescribeLayout(TypeDefinition type)
+    {
+        var layout = type.GetLayout();
+        return $"size={layout.Size} packing={layout.PackingSize}";
+    }
 
     private static string FullName(MetadataReader reader, TypeDefinition type)
     {

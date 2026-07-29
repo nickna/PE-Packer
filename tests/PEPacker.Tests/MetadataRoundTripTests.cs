@@ -1,5 +1,8 @@
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using PEPacker;
 using PEPacker.Tests.Infrastructure;
@@ -46,6 +49,55 @@ public class MetadataRoundTripTests
     public void RoundTrip_PreservesEverything_ForInterop()
     {
         AssertRoundTrips("InteropFixture", BuildInteropFixture);
+    }
+
+    /// <summary>
+    /// Reports which tables the rewriter claims to support but no fixture actually
+    /// produces, so a supported-but-unexercised table is visible rather than assumed.
+    /// </summary>
+    /// <remarks>
+    /// Every defect so far lived in a table nothing tested. This is the cheapest guard
+    /// against the next one: adding a table to the allow-list without a fixture that
+    /// produces it fails here.
+    /// </remarks>
+    [Fact]
+    public void Fixtures_Exercise_EverySupportedTable()
+    {
+        var fixtures = new (string Name, Action<ModuleBuilder> Emit)[]
+        {
+            ("BroadFixture", BuildBroadFixture),
+            ("ControlFlowFixture", BuildControlFlowFixture),
+            ("GenericFixture", BuildGenericFixture),
+            ("InteropFixture", BuildInteropFixture),
+        };
+
+        var covered = new HashSet<TableIndex>();
+        foreach (var (name, emit) in fixtures)
+        {
+            var reader = new PEReader(new MemoryStream(Build(name, emit))).GetMetadataReader();
+            foreach (TableIndex table in Enum.GetValues<TableIndex>())
+            {
+                if (reader.GetTableRowCount(table) > 0) covered.Add(table);
+            }
+        }
+
+        // Tables a PersistedAssemblyBuilder fixture cannot produce. Reaching these needs
+        // hand-built metadata or real compiler output, which is tracked separately.
+        TableIndex[] notProducibleHere =
+        [
+            TableIndex.FieldMarshal,   // MarshalAs on a field or parameter
+            TableIndex.MethodSpec,     // a call to an instantiated generic method
+        ];
+
+        var missing = AssemblyReferenceRewriter.SupportedTables
+            .Except(covered)
+            .Except(notProducibleHere)
+            .OrderBy(t => t.ToString())
+            .ToList();
+
+        Assert.True(missing.Count == 0,
+            "supported but never exercised by a round-trip fixture: " +
+            string.Join(", ", missing));
     }
 
     private static void AssertRoundTrips(string name, Action<ModuleBuilder> emit)
@@ -283,6 +335,16 @@ public class MetadataRoundTripTests
         second.SetImplementationFlags(MethodImplAttributes.PreserveSig);
 
         type.CreateType();
+
+        // An explicit-layout struct: ClassLayout for the type, FieldLayout for each
+        // positioned field. Both are copied, so both belong in the differential check
+        // rather than only in the guard's accept test.
+        var overlapped = module.DefineType("Fx.Overlapped",
+            TypeAttributes.Public | TypeAttributes.ExplicitLayout, typeof(ValueType));
+        overlapped.DefineField("AsInt", typeof(int), FieldAttributes.Public).SetOffset(0);
+        overlapped.DefineField("AsFloat", typeof(float), FieldAttributes.Public).SetOffset(0);
+        overlapped.DefineField("Tail", typeof(short), FieldAttributes.Public).SetOffset(4);
+        overlapped.CreateType();
     }
 
     // ---- helpers --------------------------------------------------------------

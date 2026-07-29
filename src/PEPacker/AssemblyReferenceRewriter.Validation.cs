@@ -13,7 +13,7 @@ public partial class AssemblyReferenceRewriter
     /// one that simply never came up in testing, surfaces as a clear error instead of
     /// vanishing from the output.
     /// </remarks>
-    private static readonly TableIndex[] SupportedTables =
+    internal static readonly TableIndex[] SupportedTables =
     [
         TableIndex.Module,
         TableIndex.TypeRef,

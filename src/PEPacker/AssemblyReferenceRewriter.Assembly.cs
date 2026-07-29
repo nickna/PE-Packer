@@ -121,6 +121,17 @@ public partial class AssemblyReferenceRewriter
             if (name is "System.Private.CoreLib" or "SharpTS")
                 continue;
 
+            // The facade set above may already have created a row for this name — the
+            // source can reference an assembly directly and also, through a CoreLib type,
+            // have it selected as a retarget destination. Emitting both left two
+            // AssemblyRef rows for one assembly; point the source handle at the existing
+            // row instead.
+            if (_newAssemblyRefs.TryGetValue(name, out var existing))
+            {
+                _assemblyRefMap[asmRefHandle] = existing;
+                continue;
+            }
+
             var newHandle = _metadata.AddAssemblyReference(
                 GetOrAddString(name),
                 asmRef.Version,
@@ -130,6 +141,7 @@ public partial class AssemblyReferenceRewriter
                 GetOrAddBlob(_reader.GetBlobBytes(asmRef.HashValue)));
 
             _assemblyRefMap[asmRefHandle] = newHandle;
+            _newAssemblyRefs[name] = newHandle;
         }
     }
 }
