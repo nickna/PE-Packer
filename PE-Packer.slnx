@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/PEPacker/PEPacker.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PEPacker.Tests/PEPacker.Tests.csproj" />
+  </Folder>
 </Solution>
