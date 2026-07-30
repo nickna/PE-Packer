@@ -23,6 +23,17 @@ public static class AppHostGenerator
     }
 
     /// <summary>
+    /// Creates a single-file executable as described by <paramref name="request"/>.
+    /// </summary>
+    /// <param name="request">What to bundle, for which target, and where to put it.</param>
+    /// <param name="mode">Bundler selection mode (auto, sdk, or builtin).</param>
+    /// <returns>Result containing the output path and which bundling technique was used.</returns>
+    public static BundleResult CreateSingleFileExecutable(BundleRequest request, BundlerMode mode = BundlerMode.Auto)
+    {
+        return BundlerFactory.GetBundler(mode).CreateSingleFileExecutable(request);
+    }
+
+    /// <summary>
     /// Creates a single-file executable from a managed DLL using the specified bundler mode.
     /// </summary>
     /// <param name="managedDllPath">Path to the managed assembly (.dll)</param>

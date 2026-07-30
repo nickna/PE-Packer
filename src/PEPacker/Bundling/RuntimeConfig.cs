@@ -8,7 +8,7 @@ namespace PEPacker.Bundling;
 /// Values mirror the host's <c>rollForward</c> setting. See
 /// <see href="https://learn.microsoft.com/dotnet/core/versions/selection"/>.
 /// </remarks>
-internal enum RollForwardPolicy
+public enum RollForwardPolicy
 {
     /// <summary>Highest patch of the requested major.minor; never a different minor.</summary>
     LatestPatch,

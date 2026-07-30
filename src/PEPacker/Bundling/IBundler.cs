@@ -68,11 +68,25 @@ public interface IBundler
     BundleTechnique Technique { get; }
 
     /// <summary>
-    /// Creates a single-file executable from a managed DLL.
+    /// Creates a single-file executable as described by <paramref name="request"/>.
+    /// </summary>
+    /// <param name="request">What to bundle, for which target, and where to put it.</param>
+    /// <returns>Result containing output path and technique used.</returns>
+    BundleResult CreateSingleFileExecutable(BundleRequest request);
+
+    /// <summary>
+    /// Creates a single-file executable from a single managed DLL, using defaults for the
+    /// target platform and framework version.
     /// </summary>
     /// <param name="dllPath">Path to the managed assembly (.dll).</param>
     /// <param name="exePath">Path for the output executable (.exe).</param>
     /// <param name="assemblyName">Name of the assembly (without extension).</param>
     /// <returns>Result containing output path and technique used.</returns>
-    BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName);
+    BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName) =>
+        CreateSingleFileExecutable(new BundleRequest
+        {
+            EntryAssemblyPath = dllPath,
+            OutputPath = exePath,
+            AssemblyName = assemblyName
+        });
 }
