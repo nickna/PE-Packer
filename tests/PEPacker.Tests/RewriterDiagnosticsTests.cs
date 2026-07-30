@@ -50,14 +50,20 @@ public class RewriterDiagnosticsTests
     }
 
     /// <summary>
-    /// A directory of managed DLLs that simply are not the framework: the load context
-    /// cannot resolve its core assembly, and the caller needs to be told that is what
-    /// went wrong.
+    /// A directory of managed DLLs that simply are not the framework. The caller needs to be
+    /// told that is what went wrong, rather than getting a bare <see cref="FileNotFoundException"/>
+    /// naming only 'System.Runtime'.
     /// </summary>
+    /// <remarks>
+    /// There is no inner exception to assert on any more. Indexing reads metadata rather than
+    /// resolving through a load context, so nothing throws: the absence of
+    /// <c>System.Runtime</c> is now checked deliberately instead of being discovered by a
+    /// failed resolution.
+    /// </remarks>
     [Fact]
     public void Ctor_DirectoryWithoutSystemRuntime_ThrowsPEPackerExceptionNotFileNotFound()
     {
-        var dir = Directory.CreateTempSubdirectory("pepacker_norheference_");
+        var dir = Directory.CreateTempSubdirectory("pepacker_noreference_");
         try
         {
             File.WriteAllBytes(Path.Combine(dir.FullName, "NotTheFramework.dll"), MinimalAssembly());
@@ -67,7 +73,6 @@ public class RewriterDiagnosticsTests
 
             Assert.Contains("System.Runtime", ex.Message);
             Assert.Contains(dir.FullName, ex.Message);
-            Assert.NotNull(ex.InnerException);
         }
         finally
         {

@@ -1,18 +1,30 @@
 using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace PEPacker;
 
 /// <summary>
-/// Builds a <see cref="IReferenceAssemblyIndex"/> by scanning a directory of framework
+/// Builds a <see cref="IReferenceAssemblyIndex"/> by reading a directory of framework
 /// assemblies — a shared framework directory or a reference pack.
 /// </summary>
 /// <remarks>
+/// <para>
 /// This is the behaviour the rewriter had built in, extracted so that an index can come
 /// from somewhere other than the filesystem. It requires the framework to be present on
 /// disk, so a Native AOT tool on a machine with no .NET installed needs a different
 /// implementation.
+/// </para>
+/// <para>
+/// Reads metadata directly with <see cref="MetadataReader"/> rather than through
+/// <c>MetadataLoadContext</c>. That dependency existed for three lookups — assembly
+/// identity, public types, forwarded types — all of which are available here, and it was
+/// the last source of trim and AOT analysis warnings in consumers' native images.
+/// </para>
 /// </remarks>
 public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
 {
@@ -22,11 +34,16 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
     /// </summary>
     private const string CoreLib = "System.Private.CoreLib";
 
+    /// <summary>
+    /// The core facade, which must resolve for the index to be usable at all.
+    /// </summary>
+    private const string SystemRuntime = "System.Runtime";
+
     private readonly Dictionary<string, string> _typeToAssembly = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AssemblyIdentity> _identities = new(StringComparer.Ordinal);
 
     /// <summary>
-    /// Scans <paramref name="referenceAssemblyPath"/> and indexes every public and forwarded
+    /// Reads <paramref name="referenceAssemblyPath"/> and indexes every public and forwarded
     /// type it finds.
     /// </summary>
     /// <param name="referenceAssemblyPath">
@@ -57,34 +74,26 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
                 RequiredReferenceDirectoryHint);
         }
 
-        var resolver = new PathAssemblyResolver(assemblies);
-
-        // Constructing the load context resolves the core assembly immediately, so a
-        // directory of unrelated DLLs fails here with a bare FileNotFoundException naming
-        // 'System.Runtime' and nothing about what was actually wanted.
-        MetadataLoadContext mlc;
-        try
+        foreach (var assemblyPath in assemblies)
         {
-            mlc = new MetadataLoadContext(resolver, "System.Runtime");
+            Index(assemblyPath);
         }
-        catch (Exception ex) when (ex is FileNotFoundException or FileLoadException
-                                      or BadImageFormatException)
+
+        // Previously the load context resolved its core assembly eagerly, so a directory of
+        // unrelated DLLs failed at construction. Reading metadata resolves nothing, so the
+        // same condition has to be checked deliberately.
+        if (!_identities.ContainsKey(SystemRuntime))
         {
             throw new PEPackerException(
                 $"Reference assembly directory '{referenceAssemblyPath}' holds {assemblies.Length} " +
-                ".dll file(s) but no usable 'System.Runtime', so the framework type map cannot be " +
-                $"built. {RequiredReferenceDirectoryHint}", ex);
-        }
-
-        using (mlc)
-        {
-            Index(mlc, assemblies);
+                $".dll file(s) but no '{SystemRuntime}', so the framework type map cannot be built. " +
+                RequiredReferenceDirectoryHint);
         }
 
         // An empty index is not a usable one: every CoreLib-scoped type reference would fall
         // back to System.Runtime and no AssemblyRef row would carry a real identity, so the
         // output would be quietly wrong rather than absent.
-        if (_typeToAssembly.Count == 0 || _identities.Count == 0)
+        if (_typeToAssembly.Count == 0)
         {
             throw new PEPackerException(
                 $"Reference assembly directory '{referenceAssemblyPath}' yielded no framework types " +
@@ -131,97 +140,288 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
         _identities.TryGetValue(simpleName, out identity);
 
     /// <summary>
-    /// Records every public and forwarded type in each assembly against its owner.
+    /// Records one assembly's identity, public types and forwarded types.
     /// </summary>
-    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
-        Justification =
-            "MetadataLoadContext is inspection-only: it reads types out of assembly files supplied " +
-            "at run time using its own type system, and never asks the runtime loader for anything. " +
-            "Trimming this application therefore cannot remove the types being enumerated here, so " +
-            "the warning does not apply. Verified working in a published Native AOT binary, which " +
-            "round-tripped an assembly through the full rewrite.")]
-    private void Index(MetadataLoadContext mlc, string[] assemblies)
+    private void Index(string assemblyPath)
     {
-        foreach (var asmPath in assemblies)
+        MetadataReader reader;
+        PEReader peReader;
+
+        try
         {
+            peReader = new PEReader(File.OpenRead(assemblyPath));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        using (peReader)
+        {
+            // The directory holds native libraries alongside managed ones (clrjit,
+            // hostpolicy, ...), and a managed file without an assembly manifest is a module
+            // rather than something with an identity. Both are expected and skipped.
             try
             {
-                var asm = mlc.LoadFromAssemblyPath(asmPath);
-                var asmName = asm.GetName();
-                var name = asmName.Name!;
-
-                // Skip implementation assemblies
-                if (name == CoreLib)
-                    continue;
-
-                _identities[name] = ToIdentity(asmName);
-
-                // Handle forwarded types. A facade routinely forwards to assemblies
-                // outside the probe directory; the exception still carries the entries
-                // that did resolve, so keep those instead of losing the whole facade.
-                Type?[] forwardedTypes;
-                try
+                if (!peReader.HasMetadata)
                 {
-                    forwardedTypes = asm.GetForwardedTypes();
-                }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    forwardedTypes = ex.Types;
+                    return;
                 }
 
-                foreach (var forwardedType in forwardedTypes)
+                reader = peReader.GetMetadataReader();
+                if (!reader.IsAssembly)
                 {
-                    if (forwardedType is { FullName: not null })
-                    {
-                        _typeToAssembly[forwardedType.FullName] = name;
-                    }
-                }
-
-                // Map all public types. A reference assembly may name types from
-                // assemblies outside the probe directory; ReflectionTypeLoadException
-                // still carries everything that did resolve, so take those rather than
-                // discarding the assembly's entire contribution.
-                Type?[] types;
-                try
-                {
-                    types = asm.GetTypes();
-                }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    types = ex.Types;
-                }
-
-                foreach (var type in types)
-                {
-                    if (type is { FullName: not null } && (type.IsPublic || type.IsNestedPublic))
-                    {
-                        _typeToAssembly[type.FullName] = name;
-                    }
+                    return;
                 }
             }
-            catch (Exception ex) when (ex is BadImageFormatException or FileLoadException
-                                          or FileNotFoundException)
+            catch (BadImageFormatException)
             {
-                // The probe directory holds native libraries alongside managed ones
-                // (clrjit, hostpolicy, ...), so these are expected and skipped. Anything
-                // else is a real fault and is left to propagate rather than degrading the
-                // type map without a word.
+                return;
+            }
+
+            try
+            {
+                var assemblyDefinition = reader.GetAssemblyDefinition();
+                var name = reader.GetString(assemblyDefinition.Name);
+
+                if (name == CoreLib)
+                {
+                    return;
+                }
+
+                _identities[name] = ToIdentity(reader, assemblyDefinition, name);
+
+                // Forwarded types first, so that a type an assembly both forwards and defines
+                // resolves to the definition — the order MetadataLoadContext produced.
+                IndexForwardedTypes(reader, name);
+                IndexPublicTypes(reader, name);
+            }
+            catch (BadImageFormatException)
+            {
+                // Malformed metadata in one file should not lose the rest of the directory.
             }
         }
     }
 
     /// <summary>
-    /// Converts a scanned <see cref="AssemblyName"/> into the identity the rewriter emits.
+    /// Indexes types this assembly forwards elsewhere, so a reference to the facade name
+    /// still resolves.
+    /// </summary>
+    /// <remarks>
+    /// <c>MetadataLoadContext.GetForwardedTypes()</c> resolved each target, so a facade
+    /// forwarding outside the probe directory threw and only the entries that happened to
+    /// resolve were recoverable. Reading the table resolves nothing, so coverage here is
+    /// strictly better.
+    /// </remarks>
+    private void IndexForwardedTypes(MetadataReader reader, string assemblyName)
+    {
+        foreach (var handle in reader.ExportedTypes)
+        {
+            var exportedType = reader.GetExportedType(handle);
+            if (!exportedType.IsForwarder)
+            {
+                continue;
+            }
+
+            var fullName = FullNameOf(reader, exportedType);
+            if (fullName is not null)
+            {
+                _typeToAssembly[fullName] = assemblyName;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Indexes the assembly's public types, nested ones included.
+    /// </summary>
+    private void IndexPublicTypes(MetadataReader reader, string assemblyName)
+    {
+        foreach (var handle in reader.TypeDefinitions)
+        {
+            var typeDefinition = reader.GetTypeDefinition(handle);
+            var visibility = typeDefinition.Attributes & TypeAttributes.VisibilityMask;
+
+            // Public top-level types and nested-public types, matching the
+            // `IsPublic || IsNestedPublic` filter this replaced. Note a nested-public type
+            // inside a non-public type qualifies, exactly as it did before.
+            if (visibility is not (TypeAttributes.Public or TypeAttributes.NestedPublic))
+            {
+                continue;
+            }
+
+            var fullName = FullNameOf(reader, typeDefinition);
+            if (fullName is not null)
+            {
+                _typeToAssembly[fullName] = assemblyName;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the reflection-style full name of a type definition, nesting included:
+    /// <c>Namespace.Outer+Inner</c>.
+    /// </summary>
+    private static string? FullNameOf(MetadataReader reader, TypeDefinition typeDefinition)
+    {
+        var name = reader.GetString(typeDefinition.Name);
+        if (name.Length == 0)
+        {
+            return null;
+        }
+
+        if (!typeDefinition.IsNested)
+        {
+            var ns = reader.GetString(typeDefinition.Namespace);
+            return ns.Length == 0 ? name : ns + "." + name;
+        }
+
+        // Walk outwards, guarding against a malformed cycle rather than looping forever.
+        var segments = new List<string> { name };
+        var declaringHandle = typeDefinition.GetDeclaringType();
+
+        for (int depth = 0; !declaringHandle.IsNil && depth < 64; depth++)
+        {
+            var declaring = reader.GetTypeDefinition(declaringHandle);
+            segments.Add(reader.GetString(declaring.Name));
+
+            if (!declaring.IsNested)
+            {
+                var ns = reader.GetString(declaring.Namespace);
+                return Compose(ns, segments);
+            }
+
+            declaringHandle = declaring.GetDeclaringType();
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Builds the full name of a forwarded type, nesting included.
+    /// </summary>
+    private static string? FullNameOf(MetadataReader reader, ExportedType exportedType)
+    {
+        var name = reader.GetString(exportedType.Name);
+        if (name.Length == 0)
+        {
+            return null;
+        }
+
+        // A nested forwarded type points at its parent exported-type row instead of carrying
+        // a namespace of its own.
+        if (exportedType.Implementation.Kind != HandleKind.ExportedType)
+        {
+            var ns = reader.GetString(exportedType.Namespace);
+            return ns.Length == 0 ? name : ns + "." + name;
+        }
+
+        var segments = new List<string> { name };
+        var parentHandle = exportedType.Implementation;
+
+        for (int depth = 0; depth < 64; depth++)
+        {
+            var parent = reader.GetExportedType((ExportedTypeHandle)parentHandle);
+            segments.Add(reader.GetString(parent.Name));
+
+            if (parent.Implementation.Kind != HandleKind.ExportedType)
+            {
+                return Compose(reader.GetString(parent.Namespace), segments);
+            }
+
+            parentHandle = parent.Implementation;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Joins outermost-first segments into <c>Namespace.Outer+Inner</c>.
+    /// </summary>
+    /// <param name="ns">Namespace of the outermost type.</param>
+    /// <param name="innermostFirst">Type name segments, innermost first.</param>
+    private static string Compose(string ns, List<string> innermostFirst)
+    {
+        var builder = new StringBuilder();
+        if (ns.Length > 0)
+        {
+            builder.Append(ns).Append('.');
+        }
+
+        for (int i = innermostFirst.Count - 1; i >= 0; i--)
+        {
+            builder.Append(innermostFirst[i]);
+            if (i > 0)
+            {
+                builder.Append('+');
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Converts an assembly manifest into the identity the rewriter emits.
     /// </summary>
     /// <remarks>
     /// Reference assemblies carry full public keys with the <c>PublicKey</c> flag set, but
-    /// the token is what an <c>AssemblyRef</c> row should hold, so the flag is cleared here
-    /// to keep the identity self-consistent.
+    /// the token is what an <c>AssemblyRef</c> row should hold, so the key is reduced to a
+    /// token and the flag dropped to keep the identity self-consistent.
     /// </remarks>
-    private static AssemblyIdentity ToIdentity(AssemblyName name) => new(
-        Name: name.Name!,
-        Version: name.Version ?? new Version(0, 0, 0, 0),
-        CultureName: name.CultureName ?? string.Empty,
-        PublicKeyToken: [.. name.GetPublicKeyToken() ?? []],
-        Flags: (AssemblyFlags)name.Flags & ~AssemblyFlags.PublicKey);
+    private static AssemblyIdentity ToIdentity(
+        MetadataReader reader,
+        AssemblyDefinition assemblyDefinition,
+        string name) => new(
+            Name: name,
+            Version: assemblyDefinition.Version,
+            CultureName: reader.GetString(assemblyDefinition.Culture),
+            PublicKeyToken: PublicKeyTokenOf(reader.GetBlobBytes(assemblyDefinition.PublicKey)),
+            Flags: assemblyDefinition.Flags & MeaningfulInAssemblyReference);
+
+    /// <summary>
+    /// The only flags an <c>AssemblyRef</c> row carries meaningfully (ECMA-335 II.23.1.5),
+    /// besides <see cref="AssemblyFlags.PublicKey"/>, which is deliberately excluded because
+    /// the identity holds a token rather than a full key.
+    /// </summary>
+    /// <remarks>
+    /// Masking rather than only clearing <c>PublicKey</c> matters. An <c>AssemblyDef</c> also
+    /// carries JIT hints and reserved bits that mean nothing in a reference: the net10.0
+    /// reference pack sets 0x70 on <c>System.Runtime</c>, none of which is a defined
+    /// <see cref="AssemblyFlags"/> value. Reading the manifest directly exposes those,
+    /// whereas <c>AssemblyName.Flags</c> did not, so propagating them would have silently
+    /// changed the emitted rows relative to every previous release — and differently
+    /// depending on whether the caller pointed at a reference pack or a shared framework.
+    /// </remarks>
+    private const AssemblyFlags MeaningfulInAssemblyReference =
+        AssemblyFlags.Retargetable | AssemblyFlags.ContentTypeMask;
+
+    /// <summary>
+    /// Reduces a full public key to its eight-byte token per ECMA-335: the low eight bytes
+    /// of its SHA-1 hash, in reverse order.
+    /// </summary>
+    /// <remarks>
+    /// SHA-1 is not a security choice here — it is what the token format specifies, and it is
+    /// what <c>AssemblyName.GetPublicKeyToken()</c> computed before this replaced it.
+    /// </remarks>
+    private static ImmutableArray<byte> PublicKeyTokenOf(byte[] publicKey)
+    {
+        // An unsigned assembly has no key, and a key already eight bytes long is a token.
+        if (publicKey.Length == 0)
+        {
+            return [];
+        }
+
+        if (publicKey.Length == 8)
+        {
+            return [.. publicKey];
+        }
+
+        var hash = SHA1.HashData(publicKey);
+        var token = new byte[8];
+        for (int i = 0; i < token.Length; i++)
+        {
+            token[i] = hash[hash.Length - 1 - i];
+        }
+
+        return [.. token];
+    }
 }
