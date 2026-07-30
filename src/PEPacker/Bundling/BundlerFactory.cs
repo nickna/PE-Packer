@@ -49,7 +49,7 @@ public static class BundlerFactory
     {
         return technique switch
         {
-            BundleTechnique.SdkBundler => new SdkBundler(),
+            BundleTechnique.SdkBundler => CreateSdkBundler(),
             BundleTechnique.ManualBundler => new ManualBundler(),
             _ => throw new ArgumentOutOfRangeException(nameof(technique))
         };
@@ -65,9 +65,7 @@ public static class BundlerFactory
     {
         return mode switch
         {
-            BundlerMode.Sdk => SdkBundlerDetector.IsSdkAvailable
-                ? new SdkBundler()
-                : throw SdkBundlerDetector.CreateUnavailableException(),
+            BundlerMode.Sdk => CreateSdkBundler(),
             BundlerMode.BuiltIn => new ManualBundler(),
             BundlerMode.Auto => CreateBundler(),
             _ => throw new ArgumentOutOfRangeException(nameof(mode))
@@ -83,5 +81,19 @@ public static class BundlerFactory
         return SdkBundlerDetector.IsSdkAvailable
             ? BundleTechnique.SdkBundler
             : BundleTechnique.ManualBundler;
+    }
+
+    /// <summary>
+    /// Keeps every factory path to <see cref="SdkBundler"/> behind the feature-switched
+    /// availability check so Native AOT can remove the implementation.
+    /// </summary>
+    private static IBundler CreateSdkBundler()
+    {
+        if (!SdkBundlerDetector.IsSdkAvailable)
+        {
+            throw SdkBundlerDetector.CreateUnavailableException();
+        }
+
+        return new SdkBundler();
     }
 }

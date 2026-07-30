@@ -21,5 +21,14 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\PEPacker\PEPacker.csproj" />
+
+    <!--
+      The SDK bundler dynamically loads Microsoft.NET.HostModel and can never run under
+      Native AOT. Marking the switch as a trim-time constant lets ILC remove that entire
+      reflection path from this native image.
+    -->
+    <RuntimeHostConfigurationOption Include="PEPacker.EnableSdkBundler"
+                                    Value="false"
+                                    Trim="true" />
   </ItemGroup>
 </Project>

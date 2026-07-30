@@ -76,6 +76,21 @@ var result = bundler.CreateSingleFileExecutable("myapp.dll", "myapp.exe", "myapp
 
 `BundlerMode.Sdk` requires `Microsoft.NET.HostModel.dll` and throws if it isn't present; `BundlerMode.Auto` (the default) tries the SDK bundler and falls back to the built-in one. `AppHostGenerator.GetPreferredTechnique()` reports which would be chosen without bundling anything.
 
+Native AOT applications should compile out the SDK bundler, which relies on dynamic assembly
+loading and cannot run there. Add this application-level item to the AOT project's `.csproj`:
+
+```xml
+<ItemGroup>
+  <RuntimeHostConfigurationOption Include="PEPacker.EnableSdkBundler"
+                                  Value="false"
+                                  Trim="true" />
+</ItemGroup>
+```
+
+The switch defaults to enabled, so managed applications keep SDK detection and
+`BundlerMode.Auto` behavior unchanged. Setting it to false makes an explicit
+`BundlerMode.Sdk` request fail with a diagnostic instead of silently changing modes.
+
 For explicit target selection, multiple assemblies, or a private apphost template,
 use `BundleRequest`:
 

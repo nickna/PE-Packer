@@ -11,7 +11,24 @@ namespace PEPacker.Bundling;
 /// </summary>
 public static class SdkBundlerDetector
 {
-    private static readonly Lazy<SdkDetectionResult> _detectionResult = new(DetectSdk, LazyThreadSafetyMode.ExecutionAndPublication);
+    /// <summary>
+    /// AppContext switch that controls whether the SDK bundler is available.
+    /// </summary>
+    /// <remarks>
+    /// Native AOT consumers can set this switch to <see langword="false"/> with a
+    /// <c>RuntimeHostConfigurationOption</c> whose <c>Trim</c> metadata is
+    /// <see langword="true"/>. That lets the compiler remove the SDK bundler and its
+    /// reflection-only implementation from the native image. The switch defaults to
+    /// <see langword="true"/> so managed applications retain the existing behavior.
+    /// </remarks>
+    public const string EnableSdkBundlerFeatureSwitchName = "PEPacker.EnableSdkBundler";
+
+    /// <summary>
+    /// Gets whether this application enables the SDK bundler.
+    /// </summary>
+    [FeatureSwitchDefinition(EnableSdkBundlerFeatureSwitchName)]
+    public static bool IsSdkBundlerEnabled =>
+        !AppContext.TryGetSwitch(EnableSdkBundlerFeatureSwitchName, out bool enabled) || enabled;
 
     /// <summary>
     /// Result of SDK detection containing availability status and assembly path.
@@ -21,12 +38,13 @@ public static class SdkBundlerDetector
     /// <summary>
     /// Gets whether the .NET SDK bundler is available.
     /// </summary>
-    public static bool IsSdkAvailable => _detectionResult.Value.IsAvailable;
+    public static bool IsSdkAvailable =>
+        IsSdkBundlerEnabled && DetectionCache.Result.Value.IsAvailable;
 
     /// <summary>
     /// Gets the detection result with full details.
     /// </summary>
-    public static SdkDetectionResult DetectionResult => _detectionResult.Value;
+    public static SdkDetectionResult DetectionResult => DetectionCache.Result.Value;
 
     /// <summary>
     /// Builds the diagnostic for a caller that demanded the SDK bundler when it is
@@ -43,6 +61,14 @@ public static class SdkBundlerDetector
     /// </remarks>
     internal static PEPackerException CreateUnavailableException()
     {
+        if (!IsSdkBundlerEnabled)
+        {
+            return new PEPackerException(
+                $"The SDK bundler is disabled by the '{EnableSdkBundlerFeatureSwitchName}' " +
+                "application feature switch. Use BundlerMode.BuiltIn, or remove the switch " +
+                "from a managed application that requires BundlerMode.Sdk.");
+        }
+
         var detection = DetectionResult;
 
         if (!RuntimeFeature.IsDynamicCodeSupported)
@@ -263,5 +289,17 @@ public static class SdkBundlerDetector
         // Note: Lazy<T> cannot be reset, but this method exists for potential
         // future test infrastructure needs. In tests, you would typically
         // mock the detection at a higher level.
+    }
+
+    /// <summary>
+    /// Keeps the SDK-detection lazy and its reference to <see cref="DetectSdk"/> out of the
+    /// detector's own type initializer. When the feature switch is compiled to
+    /// <see langword="false"/>, this nested type is unreachable and ILC can remove the entire
+    /// detection path.
+    /// </summary>
+    private static class DetectionCache
+    {
+        internal static readonly Lazy<SdkDetectionResult> Result =
+            new(DetectSdk, LazyThreadSafetyMode.ExecutionAndPublication);
     }
 }

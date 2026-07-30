@@ -97,6 +97,12 @@ PE-Packer works inside a Native AOT host — verified end to end on win-arm64 an
   catches it and reports unavailable, so `BundlerFactory` selects `ManualBundler`. Measured with
   four SDKs present: it found `Microsoft.NET.HostModel.dll` on disk and still could not load it.
   "Install the SDK" is never the right advice for that failure.
+- **Native consumers compile that dead SDK path out.** Set the application-level
+  `PEPacker.EnableSdkBundler` `RuntimeHostConfigurationOption` to `false` with `Trim="true"`.
+  The AOT smoke does this and verifies the built-in path. On win-arm64 it removed every
+  `SdkBundler` implementation symbol from the ILC map and reduced the native image from
+  4,616,704 to 4,482,560 bytes (134,144 bytes, 2.91%). The switch defaults to enabled, so
+  managed applications retain SDK detection.
 - **`RuntimeEnvironment.GetRuntimeDirectory()` returns the application's own directory** under
   AOT, on both Windows and Linux — not the empty string, so nothing looks wrong. Never use it to
   locate reference assemblies. Use `EmbeddedReferenceAssemblyIndex` or an explicit path.
