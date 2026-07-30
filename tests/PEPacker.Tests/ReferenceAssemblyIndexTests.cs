@@ -110,6 +110,65 @@ public class ReferenceAssemblyIndexTests
         Assert.True(index.TryGetIdentity("System.Runtime", out var identity));
         Assert.Equal(8, identity.PublicKeyToken.Length);
         Assert.False(identity.Flags.HasFlag(AssemblyFlags.PublicKey));
+
+        // The well-known ECMA public key token for the Microsoft framework key, which is
+        // what SHA-1-of-the-public-key-reversed must produce.
+        Assert.Equal("B03F5F7F11D50A3A", Convert.ToHexString(identity.PublicKeyToken.AsSpan()));
+    }
+
+    /// <summary>
+    /// Only the flags that mean something in an <c>AssemblyRef</c> row may survive.
+    /// </summary>
+    /// <remarks>
+    /// Reading the manifest directly exposes bits that <c>AssemblyName.Flags</c> hid: the
+    /// net10.0 reference pack sets 0x70 on <c>System.Runtime</c>, none of it a defined
+    /// <see cref="AssemblyFlags"/> value. Propagating those would have changed the emitted
+    /// rows relative to every previous release, and changed them differently depending on
+    /// whether the caller pointed at a reference pack or a shared framework.
+    /// </remarks>
+    [Fact]
+    public void DirectoryIndex_IdentityFlagsCarryOnlyMeaningfulBits()
+    {
+        const AssemblyFlags allowed = AssemblyFlags.Retargetable | AssemblyFlags.ContentTypeMask;
+
+        foreach (var dir in ReferenceDirectories())
+        {
+            var index = new DirectoryReferenceAssemblyIndex(dir);
+            Assert.True(index.TryGetIdentity("System.Runtime", out var identity));
+            Assert.Equal(default, identity.Flags & ~allowed);
+        }
+    }
+
+    /// <summary>
+    /// Both directory shapes a caller can legitimately pass, when present on this machine.
+    /// </summary>
+    private static IEnumerable<string> ReferenceDirectories()
+    {
+        yield return RuntimeEnvironment.GetRuntimeDirectory();
+
+        var refPacks = Path.Combine(
+            Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(
+                RuntimeEnvironment.GetRuntimeDirectory().TrimEnd(Path.DirectorySeparatorChar)))!)!,
+            "packs", "Microsoft.NETCore.App.Ref");
+
+        if (!Directory.Exists(refPacks))
+        {
+            yield break;
+        }
+
+        foreach (var versionDir in Directory.GetDirectories(refPacks))
+        {
+            var candidate = Path.Combine(versionDir, "ref");
+            if (!Directory.Exists(candidate)) continue;
+
+            foreach (var tfm in Directory.GetDirectories(candidate))
+            {
+                if (Directory.GetFiles(tfm, "System.Runtime.dll").Length > 0)
+                {
+                    yield return tfm;
+                }
+            }
+        }
     }
 
     [Fact]
