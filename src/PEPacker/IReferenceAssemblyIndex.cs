@@ -21,7 +21,38 @@ public sealed record AssemblyIdentity(
     Version Version,
     string CultureName,
     ImmutableArray<byte> PublicKeyToken,
-    AssemblyFlags Flags);
+    AssemblyFlags Flags)
+{
+    /// <summary>
+    /// Compares by value, token contents included.
+    /// </summary>
+    /// <remarks>
+    /// The compiler-generated equality would compare <see cref="PublicKeyToken"/> by reference,
+    /// because <see cref="ImmutableArray{T}"/> equality is reference equality of the underlying
+    /// array rather than element-wise. Two identities describing the same assembly would then be
+    /// unequal, which is the opposite of what a record promises — and it is a quiet failure,
+    /// since the tokens print identically.
+    /// </remarks>
+    public bool Equals(AssemblyIdentity? other) =>
+        other is not null
+        && Name == other.Name
+        && Version == other.Version
+        && CultureName == other.CultureName
+        && Flags == other.Flags
+        && PublicKeyToken.AsSpan().SequenceEqual(other.PublicKeyToken.AsSpan());
+
+    /// <inheritdoc/>
+    public override int GetHashCode()
+    {
+        var hash = new HashCode();
+        hash.Add(Name);
+        hash.Add(Version);
+        hash.Add(CultureName);
+        hash.Add(Flags);
+        hash.AddBytes(PublicKeyToken.AsSpan());
+        return hash.ToHashCode();
+    }
+}
 
 /// <summary>
 /// Answers the only two questions <see cref="AssemblyReferenceRewriter"/> asks about the

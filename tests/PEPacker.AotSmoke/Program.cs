@@ -65,6 +65,9 @@ internal static class Program
             Section("rewriter: in-memory index (no filesystem)");
             RewriteWithInMemoryIndex();
 
+            Section("rewriter: embedded index (no framework on disk)");
+            RewriteWithEmbeddedIndex();
+
             Section("bundling");
             var apphost = FindAppHostTemplate(out var apphostSource);
             Info("apphost template", apphost ?? "<not found>");
@@ -133,6 +136,31 @@ internal static class Program
         catch (Exception ex)
         {
             Report("rewrite with no filesystem access", false, $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// The precomputed index shipped in the package, which is what a tool with no framework on
+    /// disk actually uses.
+    /// </summary>
+    private static void RewriteWithEmbeddedIndex()
+    {
+        try
+        {
+            var index = EmbeddedReferenceAssemblyIndex.Default;
+            Info("embedded", $"{index.TypeCount} types, {index.AssemblyCount} assemblies, "
+                + $"tfm {EmbeddedReferenceAssemblyIndex.EmbeddedTargetFramework}");
+
+            var fixture = EmitFixture("SmokeAppEmbedded", out _);
+            var rewritten = Rewrite(fixture, index);
+            var references = AssemblyReferenceNames(rewritten);
+
+            Report("rewrite via the embedded index", !references.Contains("System.Private.CoreLib"),
+                string.Join(", ", references));
+        }
+        catch (Exception ex)
+        {
+            Report("rewrite via the embedded index", false, $"{ex.GetType().Name}: {ex.Message}");
         }
     }
 

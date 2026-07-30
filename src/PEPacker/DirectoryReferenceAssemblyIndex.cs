@@ -160,6 +160,28 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
     /// </summary>
     public int AssemblyCount => _identities.Count;
 
+    /// <summary>
+    /// Every type name this index can resolve, so the contents can be captured by
+    /// <see cref="EmbeddedReferenceAssemblyIndex.Write"/>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="IReferenceAssemblyIndex"/> is deliberately a lookup rather than an enumeration —
+    /// an implementation reading from a precomputed blob has no reason to be able to list itself —
+    /// so this lives here rather than on the interface.
+    /// </remarks>
+    public IEnumerable<string> TypeNames => _typeToAssembly.Keys;
+
+    /// <summary>
+    /// Every assembly name this index has an identity for.
+    /// </summary>
+    /// <remarks>
+    /// Captured alongside <see cref="TypeNames"/> so a serialised index answers
+    /// <see cref="TryGetIdentity"/> the same way this one does. Deriving the identity set from the
+    /// types alone would drop the facades that own no publicly resolvable type — 36 of 167 in the
+    /// net10.0 reference pack — and quietly make the two implementations disagree.
+    /// </remarks>
+    public IEnumerable<string> AssemblyNames => _identities.Keys;
+
     /// <inheritdoc/>
     public bool TryResolveType(string fullTypeName, [NotNullWhen(true)] out AssemblyIdentity? owner)
     {
