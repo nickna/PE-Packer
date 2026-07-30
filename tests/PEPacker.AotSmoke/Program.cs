@@ -53,6 +53,8 @@ internal static class Program
             Info("RuntimeEnvironment.GetRuntimeDirectory()", RuntimeEnvironment.GetRuntimeDirectory());
 
             Section("bundler selection degrades without dynamic code");
+            Report("SDK bundler feature compiled out", !SdkBundlerDetector.IsSdkBundlerEnabled,
+                SdkBundlerDetector.IsSdkBundlerEnabled ? "enabled" : "disabled");
             var technique = BundlerFactory.GetPreferredTechnique();
             Report("built-in bundler selected under AOT", technique == BundleTechnique.ManualBundler,
                 technique.ToString());
