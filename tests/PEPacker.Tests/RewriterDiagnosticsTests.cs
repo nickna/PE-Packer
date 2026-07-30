@@ -95,7 +95,7 @@ public class RewriterDiagnosticsTests
 
         Assert.Contains("SharpTS.Runtime.TSObject", ex.Message);
         Assert.Contains("SharpTS", ex.Message);
-        Assert.Contains("was not copied", ex.Message);
+        Assert.Contains("reference policy dropped", ex.Message);
     }
 
     /// <summary>
