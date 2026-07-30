@@ -1,3 +1,5 @@
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -9,10 +11,11 @@ namespace PEPacker.Bundling;
 /// </summary>
 /// <remarks>
 /// This avoids the SDK's <c>Microsoft.NET.HostModel.dll</c>, which <see cref="SdkBundler"/>
-/// reflects into, so it stays usable when that library is missing. It does not remove the
-/// need for an SDK installation: the apphost template still comes from the
-/// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack under the dotnet root, and
-/// <see cref="CreateSingleFileExecutable"/> throws when that pack cannot be found.
+/// reflects into, so it stays usable when that library is missing — including inside a
+/// Native AOT application, where it cannot be loaded at all. It does not remove the need for
+/// an SDK installation unless the caller supplies
+/// <see cref="BundleRequest.AppHostTemplatePath"/>: otherwise the template comes from the
+/// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack under the dotnet root.
 /// </remarks>
 public class ManualBundler : IBundler
 {
@@ -33,163 +36,360 @@ public class ManualBundler : IBundler
     private static readonly byte[] DllPathPlaceholder =
         Encoding.UTF8.GetBytes("c3ab8ff13720e8ad9047dd39466b3c8974e592c2fa383d4a3960714caef0c4f2");
 
+    /// <summary>
+    /// Assemblies are memory-mapped from the bundle, so each must start on a page boundary.
+    /// </summary>
+    /// <remarks>
+    /// Every assembly, not just the first. Only the main one used to be aligned, which was
+    /// invisible while exactly one was ever embedded.
+    /// </remarks>
+    private const int AssemblyAlignment = 4096;
+
+    /// <summary>Bundle file type for a managed assembly.</summary>
+    private const byte FileTypeAssembly = 1;
+
+    /// <summary>Bundle file type for runtimeconfig.json.</summary>
+    private const byte FileTypeRuntimeConfigJson = 4;
+
     /// <inheritdoc/>
     public BundleTechnique Technique => BundleTechnique.ManualBundler;
 
     /// <inheritdoc/>
-    public BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName)
+    public BundleResult CreateSingleFileExecutable(BundleRequest request)
     {
-        // Find the apphost template and SDK version
-        var (apphostPath, sdkVersion) = FindAppHostTemplateWithVersion();
-        if (apphostPath == null || sdkVersion == null)
+        ArgumentNullException.ThrowIfNull(request);
+        request.CancellationToken.ThrowIfCancellationRequested();
+
+        var rid = request.RuntimeIdentifier ?? GetCurrentRuntimeIdentifier();
+        GuardUnsupportedTarget(rid);
+
+        if (!request.Overwrite && File.Exists(request.OutputPath))
         {
             throw new PEPackerException(
-                "Could not find apphost template. Ensure the .NET SDK is installed.");
+                $"'{request.OutputPath}' already exists and BundleRequest.Overwrite is false.");
         }
 
-        // Read apphost template
-        var apphostBytes = File.ReadAllBytes(apphostPath);
+        var apphostBytes = LoadAndPatchAppHost(request, rid, out var headerOffsetIndex);
 
-        // 1. Patch the DLL path placeholder
-        var dllPathIndex = FindSequence(apphostBytes, DllPathPlaceholder);
-        if (dllPathIndex < 0)
+        // Entry assembly first, then any extras. The host's bundle probe matches the exact
+        // relative path "<AssemblySimpleName>.dll" at the bundle root, so a name that does not
+        // match the assembly's identity is invisible to it and fails when the runtime first
+        // needs a type from it. Validating here turns a broken executable into an error.
+        var embedded = new List<(string Path, string BundlePath)>
         {
-            throw new PEPackerException(
-                "Could not find DLL path placeholder in apphost template.");
-        }
+            (request.EntryAssemblyPath, $"{request.AssemblyName}.dll")
+        };
 
-        var dllName = $"{assemblyName}.dll";
-        var dllNameBytes = Encoding.UTF8.GetBytes(dllName);
-        Array.Clear(apphostBytes, dllPathIndex, 1024);  // Clear 1024-byte placeholder area
-        Array.Copy(dllNameBytes, 0, apphostBytes, dllPathIndex, dllNameBytes.Length);
-
-        // 2. Find the full 40-byte bundle header placeholder
-        var headerOffsetIndex = FindSequence(apphostBytes, BundleHeaderPlaceholder);
-        if (headerOffsetIndex < 0)
+        foreach (var additional in request.AdditionalAssemblies)
         {
-            throw new PEPackerException(
-                "Could not find bundle header placeholder in apphost template.");
+            embedded.Add((additional, RequireBundleNameMatchesIdentity(additional)));
         }
 
-        // Read input files
-        var dllBytes = File.ReadAllBytes(dllPath);
-        // The apphost pack version (sdkVersion) describes the PE stub, not the framework the
-        // bundle needs, so it is deliberately not used here. See RuntimeConfig.
-        var runtimeConfig = RuntimeConfig.Generate();
-        var runtimeConfigBytes = Encoding.UTF8.GetBytes(runtimeConfig);
+        var runtimeConfigBytes = Encoding.UTF8.GetBytes(
+            RuntimeConfig.Generate(request.FrameworkVersion, request.RollForward));
 
-        // Ensure output directory exists
-        var outputDir = Path.GetDirectoryName(exePath);
+        var outputDir = Path.GetDirectoryName(Path.GetFullPath(request.OutputPath));
         if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))
         {
             Directory.CreateDirectory(outputDir);
         }
 
-        // Build the bundle in memory
-        // Correct format per .NET source: [apphost] [file data...] [manifest]
-        // Offsets in manifest are ABSOLUTE positions in the bundle
-        using var bundleStream = new MemoryStream();
+        // Written to a sibling temp file and moved into place, so a failure part-way through
+        // cannot leave a truncated executable at the destination. Streaming also avoids
+        // holding the whole bundle — apphost plus every assembly — in memory.
+        var tempPath = request.OutputPath + ".tmp" + Guid.NewGuid().ToString("N")[..8];
 
-        // Write the patched apphost first
-        bundleStream.Write(apphostBytes);
-
-        // Write file 1: Main assembly DLL (with alignment for assemblies)
-        // Assemblies should be aligned to 4KB for memory-mapping
-        const int AssemblyAlignment = 4096;
-        var misalignment = bundleStream.Position % AssemblyAlignment;
-        if (misalignment != 0)
+        try
         {
-            var padding = AssemblyAlignment - misalignment;
-            for (int i = 0; i < padding; i++)
-                bundleStream.WriteByte(0);
+            WriteBundle(request, tempPath, apphostBytes, headerOffsetIndex, embedded, runtimeConfigBytes);
+
+            if (File.Exists(request.OutputPath))
+            {
+                File.Delete(request.OutputPath);
+            }
+
+            File.Move(tempPath, request.OutputPath);
+        }
+        catch
+        {
+            TryDelete(tempPath);
+            throw;
         }
 
-        var dllOffset = bundleStream.Position;  // Absolute offset
-        bundleStream.Write(dllBytes);
+        SetExecutePermission(request.OutputPath);
 
-        // Write file 2: runtimeconfig.json (no special alignment needed)
-        var configOffset = bundleStream.Position;  // Absolute offset
-        bundleStream.Write(runtimeConfigBytes);
+        return new BundleResult(request.OutputPath, BundleTechnique.ManualBundler);
+    }
 
-        // Now write the manifest at the end
-        var manifestOffset = bundleStream.Position;
-
-        var dllNameForEntry = dllName;
-        var configNameForEntry = $"{assemblyName}.runtimeconfig.json";
-
-        // Generate a deterministic bundle ID (12 chars, must be path-safe)
-        var bundleId = GenerateBundleId(dllBytes, runtimeConfigBytes);
-
-        using (var writer = new BinaryWriter(bundleStream, Encoding.UTF8, leaveOpen: true))
+    /// <inheritdoc/>
+    public BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName) =>
+        CreateSingleFileExecutable(new BundleRequest
         {
-            // Bundle header format (version 6 for .NET 6+):
-            writer.Write((uint)6);  // Major version
-            writer.Write((uint)0);  // Minor version
-            writer.Write(2);        // Number of embedded files
+            EntryAssemblyPath = dllPath,
+            OutputPath = exePath,
+            AssemblyName = assemblyName
+        });
 
-            // Bundle ID (BinaryWriter.Write(string) uses 7-bit length prefix + UTF8)
+    /// <summary>
+    /// Writes <c>[apphost][file data...][manifest]</c>, then patches the manifest offset back
+    /// into the apphost's placeholder.
+    /// </summary>
+    private static void WriteBundle(
+        BundleRequest request,
+        string tempPath,
+        byte[] apphostBytes,
+        int headerOffsetIndex,
+        List<(string Path, string BundlePath)> embedded,
+        byte[] runtimeConfigBytes)
+    {
+        using var stream = new FileStream(tempPath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+        using var contentHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+
+        stream.Write(apphostBytes);
+
+        var entries = new List<(long Offset, long Size, byte Type, string BundlePath)>();
+
+        foreach (var (path, bundlePath) in embedded)
+        {
+            request.CancellationToken.ThrowIfCancellationRequested();
+            PadTo(stream, AssemblyAlignment);
+
+            var offset = stream.Position;
+            var size = CopyInto(stream, path, contentHash);
+            entries.Add((offset, size, FileTypeAssembly, bundlePath));
+        }
+
+        var configOffset = stream.Position;
+        stream.Write(runtimeConfigBytes);
+        contentHash.AppendData(runtimeConfigBytes);
+        entries.Add((configOffset, runtimeConfigBytes.Length, FileTypeRuntimeConfigJson,
+            $"{request.AssemblyName}.runtimeconfig.json"));
+
+        var manifestOffset = stream.Position;
+
+        // Derived from every embedded byte. Hashing only the entry assembly and the config
+        // would let two bundles that differ solely in their extra assemblies collide on one
+        // extraction-cache key.
+        var bundleId = BundleIdFrom(contentHash.GetHashAndReset());
+
+        using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+        {
+            // Bundle header, version 6.0 (.NET 6+).
+            writer.Write((uint)6);
+            writer.Write((uint)0);
+            writer.Write(entries.Count);
             writer.Write(bundleId);
 
-            // deps.json location (absolute offset, size) - none
+            // deps.json location. Left absent deliberately: measured on .NET 10.0.10, bundled
+            // app assemblies resolve through the host's bundle probe, which does not consult a
+            // dependency manifest.
             writer.Write((long)0);
             writer.Write((long)0);
 
-            // runtimeconfig.json location (absolute offset, size)
             writer.Write(configOffset);
             writer.Write((long)runtimeConfigBytes.Length);
 
             // Flags (0 = none)
             writer.Write((ulong)0);
 
-            // File entry 1: Main assembly DLL
-            writer.Write(dllOffset);                          // Absolute offset
-            writer.Write((long)dllBytes.Length);              // Size
-            writer.Write((long)0);                            // Compressed size (0 = uncompressed)
-            writer.Write((byte)1);                            // FileType: Assembly
-            writer.Write(dllNameForEntry);                    // Path (BinaryWriter handles length prefix)
-
-            // File entry 2: runtimeconfig.json
-            writer.Write(configOffset);                       // Absolute offset
-            writer.Write((long)runtimeConfigBytes.Length);    // Size
-            writer.Write((long)0);                            // Compressed size (0 = uncompressed)
-            writer.Write((byte)4);                            // FileType: RuntimeConfigJson
-            writer.Write(configNameForEntry);                 // Path
+            foreach (var (offset, size, type, bundlePath) in entries)
+            {
+                writer.Write(offset);
+                writer.Write(size);
+                writer.Write((long)0);   // compressed size, 0 = stored uncompressed
+                writer.Write(type);
+                writer.Write(bundlePath);
+            }
         }
 
-        // Now patch the header offset in the apphost portion of our bundle
-        var bundleBytes = bundleStream.ToArray();
-        var offsetBytes = BitConverter.GetBytes(manifestOffset);
-        Array.Copy(offsetBytes, 0, bundleBytes, headerOffsetIndex, 8);
-
-        // Write the final bundle to disk
-        File.WriteAllBytes(exePath, bundleBytes);
-
-        // Set execute permissions on Unix
-        SetExecutePermission(exePath);
-
-        return new BundleResult(exePath, BundleTechnique.ManualBundler);
+        stream.Position = headerOffsetIndex;
+        stream.Write(BitConverter.GetBytes(manifestOffset));
+        stream.Flush();
     }
 
     /// <summary>
-    /// Generate a 12-character bundle ID by hashing the embedded file contents.
+    /// Copies a file into the bundle, hashing it on the way through, and returns its length.
     /// </summary>
-    private static string GenerateBundleId(byte[] dllBytes, byte[] configBytes)
+    private static long CopyInto(Stream destination, string path, IncrementalHash hash)
     {
-        using var sha = SHA256.Create();
+        using var source = File.OpenRead(path);
+        var buffer = new byte[81920];
+        long total = 0;
+        int read;
 
-        // Hash the DLL content
-        var dllHash = sha.ComputeHash(dllBytes);
-        sha.TransformBlock(dllHash, 0, dllHash.Length, dllHash, 0);
+        while ((read = source.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            destination.Write(buffer, 0, read);
+            hash.AppendData(buffer, 0, read);
+            total += read;
+        }
 
-        // Hash the config content
-        var configHash = SHA256.HashData(configBytes);
-        sha.TransformFinalBlock(configHash, 0, configHash.Length);
+        return total;
+    }
 
-        // Convert to Base64Url and take first 12 chars
-        var base64 = Convert.ToBase64String(sha.Hash!);
-        // Make URL-safe: replace + with -, / with _, remove padding
-        var urlSafe = base64.Replace('+', '-').Replace('/', '_').TrimEnd('=');
-        return urlSafe.Substring(0, 12);
+    /// <summary>
+    /// Pads with zeros up to the next multiple of <paramref name="alignment"/>.
+    /// </summary>
+    private static void PadTo(Stream stream, int alignment)
+    {
+        var misalignment = stream.Position % alignment;
+        if (misalignment == 0)
+        {
+            return;
+        }
+
+        Span<byte> padding = stackalloc byte[(int)(alignment - misalignment)];
+        padding.Clear();
+        stream.Write(padding);
+    }
+
+    /// <summary>
+    /// Reads the apphost template and patches in the entry assembly's file name, returning the
+    /// bytes and the offset of the bundle-header placeholder within them.
+    /// </summary>
+    private static byte[] LoadAndPatchAppHost(BundleRequest request, string rid, out int headerOffsetIndex)
+    {
+        var apphostPath = request.AppHostTemplatePath;
+
+        if (apphostPath is not null && !File.Exists(apphostPath))
+        {
+            throw new PEPackerException(
+                $"BundleRequest.AppHostTemplatePath '{apphostPath}' does not exist.");
+        }
+
+        if (apphostPath is null)
+        {
+            apphostPath = FindAppHostTemplateWithVersion(rid).Path
+                ?? throw new PEPackerException(
+                    $"Could not find an apphost template for '{rid}'. Ensure the .NET SDK is " +
+                    $"installed and includes the Microsoft.NETCore.App.Host.{rid} pack, or set " +
+                    "BundleRequest.AppHostTemplatePath explicitly.");
+        }
+
+        var apphostBytes = File.ReadAllBytes(apphostPath);
+
+        var dllPathIndex = FindSequence(apphostBytes, DllPathPlaceholder);
+        if (dllPathIndex < 0)
+        {
+            throw new PEPackerException(
+                $"Could not find the DLL path placeholder in apphost template '{apphostPath}'.");
+        }
+
+        var dllNameBytes = Encoding.UTF8.GetBytes($"{request.AssemblyName}.dll");
+        if (dllNameBytes.Length >= 1024)
+        {
+            throw new PEPackerException(
+                $"Assembly name '{request.AssemblyName}' does not fit the apphost's 1024-byte path field.");
+        }
+
+        Array.Clear(apphostBytes, dllPathIndex, 1024);
+        Array.Copy(dllNameBytes, 0, apphostBytes, dllPathIndex, dllNameBytes.Length);
+
+        headerOffsetIndex = FindSequence(apphostBytes, BundleHeaderPlaceholder);
+        if (headerOffsetIndex < 0)
+        {
+            throw new PEPackerException(
+                $"Could not find the bundle header placeholder in apphost template '{apphostPath}'.");
+        }
+
+        return apphostBytes;
+    }
+
+    /// <summary>
+    /// Refuses targets this bundler cannot produce a working executable for.
+    /// </summary>
+    /// <remarks>
+    /// macOS needs the Mach-O load-command adjustment and ad-hoc code signature that the
+    /// official HostModel bundler applies. Neither is implemented here, and arm64 macOS
+    /// refuses to execute an unsigned binary, so a patched apphost would be killed at launch
+    /// rather than merely being unusual. Failing here beats shipping that.
+    /// </remarks>
+    private static void GuardUnsupportedTarget(string rid)
+    {
+        if (rid.StartsWith("osx", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new PEPackerException(
+                $"The built-in bundler cannot target '{rid}'. macOS executables need Mach-O " +
+                "header adjustment and an ad-hoc code signature, which it does not implement, " +
+                "and arm64 macOS refuses to run an unsigned binary. Use BundlerMode.Sdk on " +
+                "macOS, which delegates to the SDK's own bundler.");
+        }
+    }
+
+    /// <summary>
+    /// Checks that a file's name matches the assembly's simple name, and returns the bundle
+    /// path to embed it under.
+    /// </summary>
+    /// <remarks>
+    /// The host's bundle probe looks up <c>&lt;SimpleName&gt;.dll</c> at the bundle root. Measured:
+    /// embedding the same assembly as <c>Renamed.dll</c>, or under a subdirectory, produces an
+    /// executable that fails with <c>FileNotFoundException</c> the moment the runtime needs a
+    /// type from it — with nothing wrong at bundling time to hint at why.
+    /// </remarks>
+    private static string RequireBundleNameMatchesIdentity(string assemblyPath)
+    {
+        if (!File.Exists(assemblyPath))
+        {
+            throw new PEPackerException(
+                $"Additional assembly '{assemblyPath}' does not exist.");
+        }
+
+        string simpleName;
+        try
+        {
+            using var peReader = new PEReader(File.OpenRead(assemblyPath));
+            var reader = peReader.GetMetadataReader();
+
+            if (!reader.IsAssembly)
+            {
+                throw new PEPackerException(
+                    $"Additional assembly '{assemblyPath}' has no assembly manifest, so the host " +
+                    "cannot resolve it from the bundle. Only assemblies can be embedded this way.");
+            }
+
+            simpleName = reader.GetString(reader.GetAssemblyDefinition().Name);
+        }
+        catch (BadImageFormatException ex)
+        {
+            throw new PEPackerException(
+                $"Additional assembly '{assemblyPath}' is not a managed assembly.", ex);
+        }
+
+        var fileName = Path.GetFileNameWithoutExtension(assemblyPath);
+        if (!string.Equals(fileName, simpleName, StringComparison.Ordinal))
+        {
+            throw new PEPackerException(
+                $"Additional assembly '{assemblyPath}' has assembly name '{simpleName}' but file " +
+                $"name '{fileName}'. The host resolves bundled assemblies by their simple name, so " +
+                $"the file must be named '{simpleName}.dll' or it will not be found at run time.");
+        }
+
+        return $"{simpleName}.dll";
+    }
+
+    /// <summary>
+    /// Reduces a content hash to a 12-character path-safe bundle identifier.
+    /// </summary>
+    private static string BundleIdFrom(byte[] hash)
+    {
+        var base64 = Convert.ToBase64String(hash);
+        return base64.Replace('+', '-').Replace('/', '_').TrimEnd('=')[..12];
+    }
+
+    private static void TryDelete(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // The temp file is already being abandoned; a failure to remove it must not
+            // replace the exception that got us here.
+        }
     }
 
     private static int FindSequence(byte[] array, byte[] sequence)
@@ -211,14 +411,20 @@ public class ManualBundler : IBundler
     }
 
     /// <summary>
-    /// Finds the apphost template and returns both the path and the SDK version.
+    /// Finds the apphost template for the current platform.
     /// </summary>
-    internal static (string? Path, Version? Version) FindAppHostTemplateWithVersion()
+    internal static (string? Path, Version? Version) FindAppHostTemplateWithVersion() =>
+        FindAppHostTemplateWithVersion(GetCurrentRuntimeIdentifier());
+
+    /// <summary>
+    /// Finds the apphost template for a specific runtime identifier, and the version of the
+    /// host pack it came from.
+    /// </summary>
+    internal static (string? Path, Version? Version) FindAppHostTemplateWithVersion(string rid)
     {
         var dotnetRoot = GetDotNetRoot();
         if (dotnetRoot == null) return (null, null);
 
-        var rid = GetCurrentRuntimeIdentifier();
         var packsDir = Path.Combine(dotnetRoot, "packs");
         var hostPackPattern = $"Microsoft.NETCore.App.Host.{rid}";
 
@@ -246,7 +452,10 @@ public class ManualBundler : IBundler
                 {
                     if (bestVersion == null || version > bestVersion)
                     {
-                        var exeName = OperatingSystem.IsWindows() ? "apphost.exe" : "apphost";
+                        // The template's own extension follows the target, not the host.
+                        var exeName = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase)
+                            ? "apphost.exe"
+                            : "apphost";
                         var apphostPath = Path.Combine(versionDir, "runtimes", rid, "native", exeName);
                         if (File.Exists(apphostPath))
                         {
@@ -288,7 +497,7 @@ public class ManualBundler : IBundler
         return null;
     }
 
-    private static string GetCurrentRuntimeIdentifier()
+    internal static string GetCurrentRuntimeIdentifier()
     {
         var arch = RuntimeInformation.OSArchitecture switch
         {

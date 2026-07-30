@@ -33,14 +33,34 @@ public class SdkBundler : IBundler
     public BundleTechnique Technique => BundleTechnique.SdkBundler;
 
     /// <inheritdoc/>
-    public BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName)
+    public BundleResult CreateSingleFileExecutable(BundleRequest request)
     {
-        // Find the apphost template
-        var (apphostPath, sdkVersion) = ManualBundler.FindAppHostTemplateWithVersion();
-        if (apphostPath == null || sdkVersion == null)
+        ArgumentNullException.ThrowIfNull(request);
+        request.CancellationToken.ThrowIfCancellationRequested();
+
+        var dllPath = request.EntryAssemblyPath;
+        var exePath = request.OutputPath;
+        var assemblyName = request.AssemblyName;
+        var rid = request.RuntimeIdentifier ?? ManualBundler.GetCurrentRuntimeIdentifier();
+
+        if (!request.Overwrite && File.Exists(exePath))
         {
             throw new PEPackerException(
-                "Could not find apphost template. Ensure the .NET SDK is installed.");
+                $"'{exePath}' already exists and BundleRequest.Overwrite is false.");
+        }
+
+        // An explicit template wins; otherwise the installed host pack for the target RID.
+        var apphostPath = request.AppHostTemplatePath;
+        if (apphostPath is null)
+        {
+            apphostPath = ManualBundler.FindAppHostTemplateWithVersion(rid).Path;
+        }
+
+        if (apphostPath == null)
+        {
+            throw new PEPackerException(
+                $"Could not find an apphost template for '{rid}'. Ensure the .NET SDK is installed, " +
+                "or set BundleRequest.AppHostTemplatePath explicitly.");
         }
 
         // Ensure output directory exists
@@ -60,14 +80,25 @@ public class SdkBundler : IBundler
             var bundleDllPath = Path.Combine(tempBundleDir, $"{assemblyName}.dll");
             File.Copy(dllPath, bundleDllPath);
 
-            // Generate runtimeconfig.json. The apphost pack version (sdkVersion) describes the
-            // PE stub, not the framework the bundle needs, so it is not used here.
-            var runtimeConfigContent = RuntimeConfig.Generate();
+            // Extra assemblies keep their own file names: the host resolves bundled assemblies
+            // by simple name, so renaming one would make it unresolvable.
+            var additional = new List<string>();
+            foreach (var extra in request.AdditionalAssemblies)
+            {
+                var staged = Path.Combine(tempBundleDir, Path.GetFileName(extra));
+                File.Copy(extra, staged, overwrite: true);
+                additional.Add(Path.GetFileName(extra));
+            }
+
+            // Generate runtimeconfig.json. The apphost pack version describes the PE stub, not
+            // the framework the bundle needs, so it plays no part here.
+            var runtimeConfigContent = RuntimeConfig.Generate(request.FrameworkVersion, request.RollForward);
             var runtimeConfigPath = Path.Combine(tempBundleDir, $"{assemblyName}.runtimeconfig.json");
             File.WriteAllText(runtimeConfigPath, runtimeConfigContent);
 
             // Use the SDK Bundler via reflection
-            InvokeSdkBundler(apphostPath, exePath, assemblyName, tempBundleDir, sdkVersion);
+            InvokeSdkBundler(apphostPath, exePath, assemblyName, tempBundleDir, additional,
+                request.FrameworkVersion, rid);
 
             return new BundleResult(exePath, BundleTechnique.SdkBundler);
         }
@@ -104,7 +135,8 @@ public class SdkBundler : IBundler
             "ManualBundler instead, so this code is unreachable there. The reflection targets " +
             "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
             "part of this application's trimmed closure.")]
-    private void InvokeSdkBundler(string apphostPath, string outputPath, string assemblyName, string sourceDir, Version sdkVersion)
+    private void InvokeSdkBundler(string apphostPath, string outputPath, string assemblyName,
+        string sourceDir, List<string> additionalAssemblies, Version? frameworkVersion, string rid)
     {
         // First, patch the apphost template with the DLL name using HostWriter
         var patchedApphostPath = Path.Combine(sourceDir, $"{assemblyName}.exe");
@@ -120,14 +152,13 @@ public class SdkBundler : IBundler
         // BundleOptions.None = 0
         var bundleOptionsNone = Enum.ToObject(bundleOptionsType, 0);
 
-        // Get the OSPlatform for current platform
-        var targetOS = GetTargetOSPlatform();
+        // Target platform comes from the requested RID rather than the host, so a bundle can be
+        // produced for a platform other than the one bundling it.
+        var targetOS = OSPlatformFor(rid);
+        var targetArch = ArchitectureFor(rid);
 
-        // Get the Architecture for current platform
-        var targetArch = RuntimeInformation.OSArchitecture;
-
-        // Calculate TFM using the running runtime version (not the SDK version)
-        var targetFrameworkVersion = new Version(Environment.Version.Major, Environment.Version.Minor);
+        var effectiveVersion = frameworkVersion ?? Environment.Version;
+        var targetFrameworkVersion = new Version(effectiveVersion.Major, effectiveVersion.Minor);
 
         // Prepare output directory (must be different from source)
         var tempOutputDir = Path.GetDirectoryName(outputPath);
@@ -161,7 +192,8 @@ public class SdkBundler : IBundler
                         throw new PEPackerException("Could not find FileSpec type in SDK.");
                     }
 
-                    var fileSpecs = CreateFileSpecList(fileSpecType, sourceDir, assemblyName, patchedApphostPath);
+                    var fileSpecs = CreateFileSpecList(fileSpecType, sourceDir, assemblyName,
+                        patchedApphostPath, additionalAssemblies);
 
                     // Find and invoke GenerateBundle method
                     var generateBundleMethod = _bundlerType.GetMethod("GenerateBundle");
@@ -327,7 +359,8 @@ public class SdkBundler : IBundler
             "ManualBundler instead, so this code is unreachable there. The reflection targets " +
             "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
             "part of this application's trimmed closure.")]
-    private object CreateFileSpecList(Type fileSpecType, string sourceDir, string assemblyName, string apphostPath)
+    private object CreateFileSpecList(Type fileSpecType, string sourceDir, string assemblyName,
+        string apphostPath, List<string> additionalAssemblies)
     {
         // Find the FileSpec constructor
         var fileSpecCtor = fileSpecType.GetConstructor([
@@ -356,6 +389,13 @@ public class SdkBundler : IBundler
         var dllSpec = fileSpecCtor.Invoke([dllPath, $"{assemblyName}.dll"]);
         addMethod.Invoke(list, [dllSpec]);
 
+        // Add any extra assemblies under their own names.
+        foreach (var extra in additionalAssemblies)
+        {
+            var extraSpec = fileSpecCtor.Invoke([Path.Combine(sourceDir, extra), extra]);
+            addMethod.Invoke(list, [extraSpec]);
+        }
+
         // Add the runtimeconfig.json
         var configPath = Path.Combine(sourceDir, $"{assemblyName}.runtimeconfig.json");
         var configSpec = fileSpecCtor.Invoke([configPath, $"{assemblyName}.runtimeconfig.json"]);
@@ -365,14 +405,33 @@ public class SdkBundler : IBundler
     }
 
     /// <summary>
-    /// Gets the current OS platform.
+    /// Maps a runtime identifier's OS portion to an <see cref="OSPlatform"/>.
     /// </summary>
-    private static OSPlatform GetTargetOSPlatform()
+    private static OSPlatform OSPlatformFor(string rid)
     {
-        if (OperatingSystem.IsWindows()) return OSPlatform.Windows;
-        if (OperatingSystem.IsLinux()) return OSPlatform.Linux;
-        if (OperatingSystem.IsMacOS()) return OSPlatform.OSX;
-        return OSPlatform.Windows; // Default fallback
+        if (rid.StartsWith("win", StringComparison.OrdinalIgnoreCase)) return OSPlatform.Windows;
+        if (rid.StartsWith("linux", StringComparison.OrdinalIgnoreCase)) return OSPlatform.Linux;
+        if (rid.StartsWith("osx", StringComparison.OrdinalIgnoreCase)) return OSPlatform.OSX;
+
+        throw new PEPackerException($"Unrecognised runtime identifier '{rid}'.");
+    }
+
+    /// <summary>
+    /// Maps a runtime identifier's architecture suffix to an <see cref="Architecture"/>.
+    /// </summary>
+    private static Architecture ArchitectureFor(string rid)
+    {
+        var dash = rid.LastIndexOf('-');
+        var arch = dash >= 0 ? rid[(dash + 1)..] : rid;
+
+        return arch.ToLowerInvariant() switch
+        {
+            "x64" => Architecture.X64,
+            "x86" => Architecture.X86,
+            "arm64" => Architecture.Arm64,
+            "arm" => Architecture.Arm,
+            _ => throw new PEPackerException($"Unrecognised architecture in runtime identifier '{rid}'.")
+        };
     }
 
     /// <summary>
