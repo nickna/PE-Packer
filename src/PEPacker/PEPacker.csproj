@@ -20,6 +20,17 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!--
+      The framework type map, precomputed so the rewriter works with no framework assemblies on
+      disk. 31.6 KB compressed for the whole net10.0 surface, which is small enough to ship
+      unconditionally rather than behind an opt-in. Regeneration command is in
+      EmbeddedReferenceAssemblyIndex's remarks.
+    -->
+    <EmbeddedResource Include="Resources/refindex-net10.0.bin"
+                      LogicalName="PEPacker.Resources.refindex-net10.0.bin" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="PEPacker.Tests" />
   </ItemGroup>
 
