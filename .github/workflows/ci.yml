@@ -39,3 +39,25 @@ jobs:
 
       - name: Test
         run: dotnet test PE-Packer.slnx --no-build --configuration Release --verbosity normal
+
+      # PEPacker is published inside Native AOT applications, so it has to stay free of
+      # trim/AOT analyzer warnings. It is at zero; without this an ordinary PR can
+      # reintroduce a blocker silently, since the warnings are only visible to consumers
+      # at their publish time.
+      #
+      # --no-incremental is load-bearing: analyzer warnings are emitted only when the
+      # compiler actually runs, so an up-to-date build reports nothing and would let this
+      # pass vacuously. Matching on the IL prefix rather than a list of codes means a
+      # warning class we have not seen yet still fails.
+      - name: AOT and trim analyzer ratchet
+        run: |
+          set -o pipefail
+          dotnet build src/PEPacker/PEPacker.csproj --no-restore --configuration Release \
+            --no-incremental 2>&1 | tee analyzer-build.log
+          if grep -E "warning IL[0-9]+" analyzer-build.log; then
+            echo "::error::New trim/AOT analyzer warnings above. PEPacker must stay AOT-clean; \
+          suppress with [UnconditionalSuppressMessage] and a justification only when the \
+          warning is provably inapplicable."
+            exit 1
+          fi
+          echo "No trim/AOT analyzer warnings."

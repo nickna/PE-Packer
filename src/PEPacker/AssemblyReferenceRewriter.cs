@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
@@ -182,6 +183,13 @@ public partial class AssemblyReferenceRewriter : IDisposable
     /// <summary>
     /// Populates the type and assembly maps from an already-resolved load context.
     /// </summary>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
+        Justification =
+            "MetadataLoadContext is inspection-only: it reads types out of assembly files supplied " +
+            "at run time using its own type system, and never asks the runtime loader for anything. " +
+            "Trimming this application therefore cannot remove the types being enumerated here, so " +
+            "the warning does not apply. Verified working in a published Native AOT binary, which " +
+            "round-tripped an assembly through the full rewrite.")]
     private void BuildTypeToAssemblyMapping(MetadataLoadContext mlc, string[] assemblies)
     {
         foreach (var asmPath in assemblies)

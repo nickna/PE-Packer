@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -78,6 +79,13 @@ public static class SdkBundlerDetector
     /// <summary>
     /// Performs SDK detection (called once via Lazy).
     /// </summary>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
+        Justification =
+            "Loads Microsoft.NET.HostModel.dll from the installed SDK on disk, so the types read " +
+            "from it are not part of this application's trimmed closure and cannot be removed by " +
+            "trimming it. Under Native AOT the load throws and is caught here, which is the " +
+            "supported outcome: detection reports unavailable and BundlerFactory selects " +
+            "ManualBundler.")]
     private static SdkDetectionResult DetectSdk()
     {
         var hostModelPath = FindHostModelDll();

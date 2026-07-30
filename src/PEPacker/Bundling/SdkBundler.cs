@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -86,6 +87,22 @@ public class SdkBundler : IBundler
     /// <summary>
     /// Invokes the SDK Bundler via reflection.
     /// </summary>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2080:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
     private void InvokeSdkBundler(string apphostPath, string outputPath, string assemblyName, string sourceDir, Version sdkVersion)
     {
         // First, patch the apphost template with the DLL name using HostWriter
@@ -293,6 +310,22 @@ public class SdkBundler : IBundler
     /// <summary>
     /// Creates a List of FileSpec objects for the bundler.
     /// </summary>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2070:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL3050:RequiresDynamicCode",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
     private object CreateFileSpecList(Type fileSpecType, string sourceDir, string assemblyName, string apphostPath)
     {
         // Find the FileSpec constructor
@@ -344,6 +377,30 @@ public class SdkBundler : IBundler
     /// <summary>
     /// Patches the apphost template with the DLL name using HostWriter.
     /// </summary>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2072:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2075:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
     private void PatchAppHost(string apphostSourcePath, string apphostDestPath, string appBinaryName)
     {
         // Get the HostWriter type

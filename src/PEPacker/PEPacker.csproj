@@ -6,6 +6,17 @@
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+
+    <!--
+      Consumers publish this inside Native AOT applications, so the trim, AOT and
+      single-file analyzers run on every build rather than only when someone remembers
+      to pass the flags. Verified: a published native binary round-trips an assembly
+      through the full rewrite and produces a working single-file executable.
+      TrimmerSingleWarn=false reports per-callsite rather than as one assembly rollup,
+      which is what makes the CI ratchet meaningful.
+    -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
   </PropertyGroup>
 
   <ItemGroup>
