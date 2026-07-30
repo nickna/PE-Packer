@@ -49,18 +49,13 @@ public class SdkBundler : IBundler
                 $"'{exePath}' already exists and BundleRequest.Overwrite is false.");
         }
 
-        // An explicit template wins; otherwise the installed host pack for the target RID.
+        // An explicit template wins. Embedded templates are resolved after the temporary
+        // directory exists because HostModel requires a path rather than a stream.
         var apphostPath = request.AppHostTemplatePath;
-        if (apphostPath is null)
-        {
-            apphostPath = ManualBundler.FindAppHostTemplateWithVersion(rid).Path;
-        }
-
-        if (apphostPath == null)
+        if (apphostPath is not null && !File.Exists(apphostPath))
         {
             throw new PEPackerException(
-                $"Could not find an apphost template for '{rid}'. Ensure the .NET SDK is installed, " +
-                "or set BundleRequest.AppHostTemplatePath explicitly.");
+                $"BundleRequest.AppHostTemplatePath '{apphostPath}' does not exist.");
         }
 
         // Ensure output directory exists
@@ -76,6 +71,27 @@ public class SdkBundler : IBundler
 
         try
         {
+            if (apphostPath is null)
+            {
+                if (EmbeddedAppHostProvider.TryRead(rid, out var embeddedAppHost))
+                {
+                    apphostPath = Path.Combine(tempBundleDir, "apphost-template");
+                    File.WriteAllBytes(apphostPath, embeddedAppHost!);
+                }
+                else
+                {
+                    apphostPath = ManualBundler.FindAppHostTemplateWithVersion(rid).Path;
+                }
+            }
+
+            if (apphostPath is null)
+            {
+                throw new PEPackerException(
+                    $"Could not resolve an apphost template for '{rid}'. No embedded template " +
+                    "is shipped for that RID, no Microsoft.NETCore.App.Host pack was found " +
+                    "under the dotnet root, and BundleRequest.AppHostTemplatePath was not set.");
+            }
+
             // Copy the DLL to the bundle directory
             var bundleDllPath = Path.Combine(tempBundleDir, $"{assemblyName}.dll");
             File.Copy(dllPath, bundleDllPath);
