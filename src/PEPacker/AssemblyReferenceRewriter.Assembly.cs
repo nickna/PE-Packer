@@ -71,41 +71,33 @@ public partial class AssemblyReferenceRewriter
                 if (_referencePolicy(asmName) == ReferenceAction.RetargetToFacades)
                 {
                     var typeName = GetFullTypeName(typeRef);
-                    if (_typeToAssembly.TryGetValue(typeName, out var targetAsm))
-                    {
-                        neededAssemblies.Add(targetAsm);
-                    }
-                    else
-                    {
-                        // Default to System.Runtime for unknown types
-                        neededAssemblies.Add("System.Runtime");
-                    }
+
+                    // Default to System.Runtime for types the index does not know.
+                    neededAssemblies.Add(_referenceIndex.TryResolveType(typeName, out var owner)
+                        ? owner.Name
+                        : "System.Runtime");
                 }
             }
         }
 
-        // Always include System.Runtime as the core runtime assembly.
-        // This ensures deterministic behavior across platforms since Directory.GetFiles()
-        // returns files in different orders on Windows (alphabetical) vs Linux (inode order),
-        // which affects type-to-assembly mapping when types exist in multiple assemblies.
+        // Always include System.Runtime as the core runtime assembly. A directory-backed
+        // index sees files in different orders on Windows (alphabetical) and Linux (inode
+        // order), which changes which assembly wins for a type defined in more than one, so
+        // pinning the core facade keeps the output deterministic.
         neededAssemblies.Add("System.Runtime");
 
-        // Create references for all needed SDK assemblies
+        // Create references for all needed SDK assemblies. The identity already carries a
+        // public key token rather than a full key, with the PublicKey flag cleared to match.
         foreach (var asmName in neededAssemblies)
         {
-            if (_assemblyInfoCache.TryGetValue(asmName, out var asmInfo))
+            if (_referenceIndex.TryGetIdentity(asmName, out var identity))
             {
-                // Use public key token (not full public key) and clear the PublicKey flag.
-                // The SDK reference assemblies have the PublicKey flag set with full public keys,
-                // but GetPublicKeyToken() returns just the 8-byte token which is more compatible.
-                var flags = (AssemblyFlags)asmInfo.Flags & ~AssemblyFlags.PublicKey;
-
                 var handle = _metadata.AddAssemblyReference(
-                    GetOrAddString(asmInfo.Name!),
-                    asmInfo.Version!,
-                    GetOrAddString(asmInfo.CultureName ?? string.Empty),
-                    GetOrAddBlob(asmInfo.GetPublicKeyToken() ?? []),
-                    flags,
+                    GetOrAddString(identity.Name),
+                    identity.Version,
+                    GetOrAddString(identity.CultureName),
+                    GetOrAddBlob(identity.PublicKeyToken.IsDefaultOrEmpty ? [] : [.. identity.PublicKeyToken]),
+                    identity.Flags,
                     default);
 
                 _newAssemblyRefs[asmName] = handle;
