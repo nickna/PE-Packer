@@ -21,8 +21,7 @@ public class SdkBundler : IBundler
         var detection = SdkBundlerDetector.DetectionResult;
         if (!detection.IsAvailable || detection.BundlerType == null || detection.HostModelAssembly == null)
         {
-            throw new PEPackerException(
-                "SDK Bundler is not available. Use BundlerFactory to get the appropriate bundler.");
+            throw SdkBundlerDetector.CreateUnavailableException();
         }
 
         _bundlerType = detection.BundlerType;

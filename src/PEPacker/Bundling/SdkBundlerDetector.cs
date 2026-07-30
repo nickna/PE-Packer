@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace PEPacker.Bundling;
@@ -25,6 +26,54 @@ public static class SdkBundlerDetector
     /// Gets the detection result with full details.
     /// </summary>
     public static SdkDetectionResult DetectionResult => _detectionResult.Value;
+
+    /// <summary>
+    /// Builds the diagnostic for a caller that demanded the SDK bundler when it is
+    /// unavailable, distinguishing the three reasons that can happen.
+    /// </summary>
+    /// <remarks>
+    /// The previous single message told every caller to "Ensure the .NET SDK is installed",
+    /// which is actively wrong under Native AOT: detection fails there even with a complete
+    /// SDK present, because <see cref="Assembly.LoadFrom"/> is unavailable as a property of
+    /// the compilation model rather than because anything is missing. Measured on a machine
+    /// with four SDKs and seven runtimes installed, a native binary located
+    /// <c>Microsoft.NET.HostModel.dll</c> on disk and still could not load it — so the
+    /// advice sent the reader to install something they already had.
+    /// </remarks>
+    internal static PEPackerException CreateUnavailableException()
+    {
+        var detection = DetectionResult;
+
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+        {
+            string found = detection.HostModelPath is null
+                ? "."
+                : $", even though it was found at '{detection.HostModelPath}'.";
+
+            return new PEPackerException(
+                "The SDK bundler must load Microsoft.NET.HostModel.dll at run time, and dynamic " +
+                $"assembly loading is unavailable in a Native AOT build{found} " +
+                "Installing the .NET SDK does not enable it — the limitation is the compilation " +
+                "model, not a missing installation. Use BundlerMode.BuiltIn, which BundlerMode.Auto " +
+                "already selects automatically here, or run a managed (non-AOT) build if the SDK " +
+                "bundler is specifically required.");
+        }
+
+        if (detection.HostModelPath is null)
+        {
+            return new PEPackerException(
+                "The SDK bundler is unavailable because no .NET SDK was found: " +
+                "Microsoft.NET.HostModel.dll is not present under any known dotnet root. Install " +
+                "the .NET SDK, set DOTNET_ROOT if it is installed somewhere non-standard, or use " +
+                "BundlerMode.BuiltIn.");
+        }
+
+        return new PEPackerException(
+            $"The SDK bundler is unavailable: '{detection.HostModelPath}' was found but could not " +
+            "be loaded, or does not contain Microsoft.NET.HostModel.Bundle.Bundler. The SDK " +
+            "installation may be damaged or a different version than expected. Use " +
+            "BundlerMode.BuiltIn to bundle without it.");
+    }
 
     /// <summary>
     /// Performs SDK detection (called once via Lazy).

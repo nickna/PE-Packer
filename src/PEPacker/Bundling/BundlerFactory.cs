@@ -67,9 +67,7 @@ public static class BundlerFactory
         {
             BundlerMode.Sdk => SdkBundlerDetector.IsSdkAvailable
                 ? new SdkBundler()
-                : throw new PEPackerException(
-                    "SDK bundler is not available on this system. " +
-                    "Ensure the .NET SDK is installed, or use BundlerMode.BuiltIn for the built-in bundler."),
+                : throw SdkBundlerDetector.CreateUnavailableException(),
             BundlerMode.BuiltIn => new ManualBundler(),
             BundlerMode.Auto => CreateBundler(),
             _ => throw new ArgumentOutOfRangeException(nameof(mode))

@@ -33,7 +33,21 @@ public partial class AssemblyReferenceRewriter
                         }
                         else
                         {
-                            newResolutionScope = _assemblyRefMap[oldAsmRef];
+                            // CreateAssemblyReferences excludes some assemblies by name, so this
+                            // map can legitimately have no entry. A bare indexer turned that into
+                            // a KeyNotFoundException naming neither the type nor the reference —
+                            // matching the ModuleReference arm below is the least a caller needs.
+                            if (!_assemblyRefMap.TryGetValue(oldAsmRef, out var newAsmRef))
+                            {
+                                throw new PEPackerException(
+                                    $"Type reference '{fullName}' is scoped to assembly reference " +
+                                    $"'{oldAsmName}' (0x{MetadataTokens.GetToken(oldAsmRef):X8}), " +
+                                    "which was not copied to the output. The rewriter excludes that " +
+                                    "assembly from the rewritten image, so a type reference scoped " +
+                                    "to it cannot be remapped. Either the source should not depend " +
+                                    "on it, or the exclusion needs to become configurable.");
+                            }
+                            newResolutionScope = newAsmRef;
                         }
                         break;
                     }
