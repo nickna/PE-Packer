@@ -49,7 +49,7 @@ jobs:
       # compiler actually runs, so an up-to-date build reports nothing and would let this
       # pass vacuously. Matching on the IL prefix rather than a list of codes means a
       # warning class we have not seen yet still fails.
-      - name: AOT and trim analyzer ratchet
+      - name: AOT analyzer ratchet
         run: |
           set -o pipefail
           dotnet build src/PEPacker/PEPacker.csproj --no-restore --configuration Release \
@@ -61,3 +61,38 @@ jobs:
             exit 1
           fi
           echo "No trim/AOT analyzer warnings."
+
+  # The in-process suite above can never be AOT: it loads emitted assemblies in-process, so it
+  # has to stay managed. That leaves the whole "works under JIT, breaks under AOT" class
+  # invisible to it -- Assembly.LoadFrom failing, RuntimeEnvironment.GetRuntimeDirectory()
+  # returning the app's own directory. This job publishes a real native binary and drives
+  # PEPacker through it.
+  #
+  # It also runs on Linux, so it is the only coverage of the non-Windows paths (execute-bit
+  # setting, dotnet-root probing, apphost naming without .exe).
+  aot-smoke:
+    name: aot-smoke (linux-x64, native)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # ILC shells out to a C++ linker; without these the link step fails rather than the
+      # test failing, which is a confusing way to learn the toolchain is incomplete.
+      - name: Install Native AOT prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Publish the smoke host as Native AOT
+        run: |
+          dotnet publish tests/PEPacker.AotSmoke/PEPacker.AotSmoke.csproj \
+            --configuration Release -r linux-x64
+
+      # The host prints one line per check and exits non-zero if any required step failed, so
+      # the log says what was covered rather than only whether it passed.
+      - name: Run the smoke host
+        run: ./tests/PEPacker.AotSmoke/bin/Release/net10.0/linux-x64/publish/PEPacker.AotSmoke
