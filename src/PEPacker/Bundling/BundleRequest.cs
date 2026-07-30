@@ -67,8 +67,9 @@ public sealed record BundleRequest
     public RollForwardPolicy RollForward { get; init; } = RollForwardPolicy.LatestMinor;
 
     /// <summary>
-    /// An explicit apphost template to patch. When null, the installed
-    /// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack is used.
+    /// An explicit apphost template to patch. When null, PEPacker uses its embedded
+    /// template for supported Windows/Linux RIDs, then falls back to an installed
+    /// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack.
     /// </summary>
     public string? AppHostTemplatePath { get; init; }
 

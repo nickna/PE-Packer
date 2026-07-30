@@ -76,7 +76,7 @@ Key invariants to preserve when editing:
 
 Packs a managed DLL into a self-contained `.exe` using the .NET apphost. `AppHostGenerator` is a thin facade; the real work is behind `IBundler`:
 - `SdkBundler` — reflects into the SDK's `Microsoft.NET.HostModel.dll` `Bundler` type (detected/loaded by `SdkBundlerDetector`).
-- `ManualBundler` — byte-patches the apphost template directly, avoiding a dependency on `Microsoft.NET.HostModel`. Relies on known placeholder byte sequences (bundle-header SHA and DLL-path SHA) baked into the apphost. Note it still needs an installed SDK: `FindAppHostTemplateWithVersion()` locates the apphost in the `Microsoft.NETCore.App.Host.<rid>` pack, and both bundlers call it.
+- `ManualBundler` — byte-patches the apphost template directly, avoiding a dependency on `Microsoft.NET.HostModel`. Relies on known placeholder byte sequences (bundle-header SHA and DLL-path SHA) baked into the apphost. Six Windows/Linux templates are embedded; resolution order is explicit `BundleRequest.AppHostTemplatePath` → embedded RID → installed host pack.
 - `FallbackBundler` — tries primary, falls back to secondary on failure.
 - `BundlerFactory` — picks SDK-with-fallback when available, else built-in; caches the instance. `BundlerMode` (`Auto`/`Sdk`/`BuiltIn`) forces a choice.
 
@@ -105,8 +105,13 @@ PE-Packer works inside a Native AOT host — verified end to end on win-arm64 an
 - **The analyzer surface is ratcheted at zero.** CI fails on any new `IL####` warning. Suppress
   only with `[UnconditionalSuppressMessage]` and a justification that says why it is inapplicable.
 
-The remaining SDK dependency is the apphost template (issue #14). `BundleRequest.AppHostTemplatePath`
-is the escape hatch, and both the smoke host and the bundling tests use it.
+The apphost-template SDK dependency from issue #14 is removed. `PEPacker.csproj` downloads the
+10.0.0 host packs at build time and embeds `win-x64`, `win-x86`, `win-arm64`, `linux-x64`,
+`linux-arm`, and `linux-arm64` (634 KB raw in `PEPacker.dll`, about 249 KB after NuGet
+compression). Set `PEPackerEmbedAppHosts=false` only when producing a private payload-minimal
+source build; that build falls back to an explicit template or installed host pack. The Native
+AOT smoke temporarily points `DOTNET_ROOT` at an empty directory while bundling, so it proves the
+embedded path rather than accidentally borrowing the runner's SDK.
 
 **Recurring bug class:** framework and pack directory names sorted as strings put `9.0.17` and
 `10.0.9` above `10.0.10`. This has been fixed three separate times (the original runtimeconfig

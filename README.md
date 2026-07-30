@@ -17,13 +17,13 @@ The library also includes **single-file bundling** — the ability to package a 
 ## Features
 
 - **Assembly Reference Rewriting** — Rewrites `System.Private.CoreLib` references to SDK reference assemblies (`System.Runtime`, `System.Collections`, etc.). Handles generics, nested types, method specs, properties, events, P/Invoke, custom attributes and IL token patching. Refuses input it cannot reproduce faithfully rather than emitting a lossy assembly — see [Scope and limitations](#scope-and-limitations).
-- **Single-File Bundling** — Creates single-file .NET executables. Automatically selects the SDK bundler when available, falls back to the built-in bundler.
+- **Single-File Bundling** — Creates single-file .NET executables. Automatically selects the SDK bundler when available, falls back to the built-in bundler. Windows and Linux apphost templates are embedded, so built-in bundling does not require an installed SDK.
 - **App Host Generation** — Generates standalone executable wrappers around .NET DLLs with proper runtime configuration.
 
 ## Requirements
 
 - **.NET 10** — the package targets `net10.0`.
-- **An installed .NET SDK** for the bundling APIs. Both bundlers read the apphost template from the `Microsoft.NETCore.App.Host.<rid>` pack under the dotnet root (`DOTNET_ROOT`, or the default install location). The rewriting APIs do not need this.
+- The built-in bundler needs no installed SDK for `win-x64`, `win-x86`, `win-arm64`, `linux-x64`, `linux-arm`, or `linux-arm64`; those apphost templates ship in the package. The SDK bundler requires an installed .NET SDK. Both output a framework-dependent executable, so the target machine still needs a compatible .NET runtime.
 
 ## Installation
 
@@ -76,6 +76,23 @@ var result = bundler.CreateSingleFileExecutable("myapp.dll", "myapp.exe", "myapp
 
 `BundlerMode.Sdk` requires `Microsoft.NET.HostModel.dll` and throws if it isn't present; `BundlerMode.Auto` (the default) tries the SDK bundler and falls back to the built-in one. `AppHostGenerator.GetPreferredTechnique()` reports which would be chosen without bundling anything.
 
+For explicit target selection, multiple assemblies, or a private apphost template,
+use `BundleRequest`:
+
+```csharp
+var result = AppHostGenerator.CreateSingleFileExecutable(
+    new BundleRequest
+    {
+        EntryAssemblyPath = "myapp.dll",
+        OutputPath = "myapp",
+        AssemblyName = "myapp",
+        AdditionalAssemblies = ["MyRuntime.dll"],
+        RuntimeIdentifier = "linux-arm64",
+        FrameworkVersion = new Version(10, 0)
+    },
+    BundlerMode.BuiltIn);
+```
+
 ## Scope and limitations
 
 ### Rewriting
@@ -91,7 +108,7 @@ The rewritten image also drops the strong-name signature — output is never re-
 
 ### Bundling
 
-Both bundlers embed the main assembly plus a generated `runtimeconfig.json`, and nothing else — no `deps.json` and no additional dependency assemblies. The result is a framework-dependent single-file executable for an app whose managed code is one assembly; it is not a self-contained deployment and will not carry a dependency graph. The generated `runtimeconfig.json` pins the framework version to the runtime currently executing the packer.
+Both bundlers embed the main assembly, any `AdditionalAssemblies`, and a generated `runtimeconfig.json`. A `.deps.json` is not required for these bundled application assemblies. The result remains framework-dependent rather than self-contained: the target machine needs a compatible .NET runtime. The built-in bundler deliberately refuses macOS because it does not yet perform the required Mach-O adjustment and ad-hoc signing.
 
 ## Development
 

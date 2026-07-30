@@ -12,10 +12,9 @@ namespace PEPacker.Bundling;
 /// <remarks>
 /// This avoids the SDK's <c>Microsoft.NET.HostModel.dll</c>, which <see cref="SdkBundler"/>
 /// reflects into, so it stays usable when that library is missing — including inside a
-/// Native AOT application, where it cannot be loaded at all. It does not remove the need for
-/// an SDK installation unless the caller supplies
-/// <see cref="BundleRequest.AppHostTemplatePath"/>: otherwise the template comes from the
-/// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack under the dotnet root.
+/// Native AOT application, where it cannot be loaded at all. Apphost templates for supported
+/// Windows and Linux RIDs are embedded in PEPacker; an explicit template or an installed
+/// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack supplies other/private builds.
 /// </remarks>
 public class ManualBundler : IBundler
 {
@@ -250,6 +249,8 @@ public class ManualBundler : IBundler
     private static byte[] LoadAndPatchAppHost(BundleRequest request, string rid, out int headerOffsetIndex)
     {
         var apphostPath = request.AppHostTemplatePath;
+        byte[] apphostBytes;
+        string apphostDescription;
 
         if (apphostPath is not null && !File.Exists(apphostPath))
         {
@@ -257,22 +258,36 @@ public class ManualBundler : IBundler
                 $"BundleRequest.AppHostTemplatePath '{apphostPath}' does not exist.");
         }
 
-        if (apphostPath is null)
+        if (apphostPath is not null)
         {
-            apphostPath = FindAppHostTemplateWithVersion(rid).Path
-                ?? throw new PEPackerException(
-                    $"Could not find an apphost template for '{rid}'. Ensure the .NET SDK is " +
-                    $"installed and includes the Microsoft.NETCore.App.Host.{rid} pack, or set " +
-                    "BundleRequest.AppHostTemplatePath explicitly.");
+            apphostBytes = File.ReadAllBytes(apphostPath);
+            apphostDescription = apphostPath;
         }
+        else if (EmbeddedAppHostProvider.TryRead(rid, out var embeddedAppHost))
+        {
+            apphostBytes = embeddedAppHost!;
+            apphostDescription = $"embedded apphost for '{rid}'";
+        }
+        else
+        {
+            apphostPath = FindAppHostTemplateWithVersion(rid).Path;
+            if (apphostPath is null)
+            {
+                throw new PEPackerException(
+                    $"Could not resolve an apphost template for '{rid}'. No embedded template " +
+                    "is shipped for that RID, no Microsoft.NETCore.App.Host pack was found " +
+                    "under the dotnet root, and BundleRequest.AppHostTemplatePath was not set.");
+            }
 
-        var apphostBytes = File.ReadAllBytes(apphostPath);
+            apphostBytes = File.ReadAllBytes(apphostPath);
+            apphostDescription = apphostPath;
+        }
 
         var dllPathIndex = FindSequence(apphostBytes, DllPathPlaceholder);
         if (dllPathIndex < 0)
         {
             throw new PEPackerException(
-                $"Could not find the DLL path placeholder in apphost template '{apphostPath}'.");
+                $"Could not find the DLL path placeholder in {apphostDescription}.");
         }
 
         var dllNameBytes = Encoding.UTF8.GetBytes($"{request.AssemblyName}.dll");
@@ -289,7 +304,7 @@ public class ManualBundler : IBundler
         if (headerOffsetIndex < 0)
         {
             throw new PEPackerException(
-                $"Could not find the bundle header placeholder in apphost template '{apphostPath}'.");
+                $"Could not find the bundle header placeholder in {apphostDescription}.");
         }
 
         return apphostBytes;

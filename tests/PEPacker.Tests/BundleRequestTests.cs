@@ -40,8 +40,6 @@ public class BundleRequestTests : IDisposable
     [Fact]
     public void MultiAssemblyBundle_Executes_WithNoDepsJson()
     {
-        var apphost = RequireAppHost();
-
         var libPath = EmitLibrary("ProbeLib");
         var appPath = EmitAppCalling(libPath, "ProbeApp");
         var exePath = Path.Combine(_work, "out", "ProbeApp" + ExeSuffix);
@@ -52,7 +50,6 @@ public class BundleRequestTests : IDisposable
             OutputPath = exePath,
             AssemblyName = "ProbeApp",
             AdditionalAssemblies = [libPath],
-            AppHostTemplatePath = apphost,
         }, BundlerMode.BuiltIn);
 
         Assert.Equal(exePath, result.OutputPath);

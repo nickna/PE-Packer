@@ -68,11 +68,8 @@ internal static class Program
             Section("rewriter: embedded index (no framework on disk)");
             RewriteWithEmbeddedIndex();
 
-            Section("bundling");
-            var apphost = FindAppHostTemplate(out var apphostSource);
-            Info("apphost template", apphost ?? "<not found>");
-            Info("apphost source", apphostSource);
-            Bundle(apphost);
+            Section("bundling from embedded apphost (no SDK)");
+            Bundle();
 
             Console.WriteLine();
             Console.WriteLine(_failures == 0
@@ -167,15 +164,8 @@ internal static class Program
     /// <summary>
     /// Bundles one and then two assemblies, running each result.
     /// </summary>
-    private static void Bundle(string? apphostTemplate)
+    private static void Bundle()
     {
-        if (apphostTemplate is null)
-        {
-            Report("apphost template located", false,
-                "no template in the dotnet root or the NuGet cache; bundling cannot be tested");
-            return;
-        }
-
         var exeSuffix = OperatingSystem.IsWindows() ? ".exe" : string.Empty;
 
         // Single assembly, which is all the bundler could express before BundleRequest.
@@ -184,12 +174,11 @@ internal static class Program
             var app = EmitFixture("SoloApp", out _);
             var exe = Path.Combine(_work, "solo", "SoloApp" + exeSuffix);
 
-            var result = AppHostGenerator.CreateSingleFileExecutable(new BundleRequest
+            var result = BundleWithDotNetRootHidden(new BundleRequest
             {
                 EntryAssemblyPath = app,
                 OutputPath = exe,
                 AssemblyName = "SoloApp",
-                AppHostTemplatePath = apphostTemplate,
             });
 
             Info("single-assembly bundle", $"{result.TechniqueDescription}, {new FileInfo(exe).Length} bytes");
@@ -210,13 +199,12 @@ internal static class Program
             var app = EmitFixture("DuoApp", out _, loadAssemblyByName: "SmokeLib");
             var exe = Path.Combine(_work, "duo", "DuoApp" + exeSuffix);
 
-            AppHostGenerator.CreateSingleFileExecutable(new BundleRequest
+            BundleWithDotNetRootHidden(new BundleRequest
             {
                 EntryAssemblyPath = app,
                 OutputPath = exe,
                 AssemblyName = "DuoApp",
                 AdditionalAssemblies = [library],
-                AppHostTemplatePath = apphostTemplate,
             });
 
             var (code, stdout, stderr) = Run(exe);
@@ -230,46 +218,25 @@ internal static class Program
     }
 
     /// <summary>
-    /// Locates an apphost, preferring the installed host pack and falling back to the NuGet
-    /// cache — which is where it lives on a machine that has restored it but has no host pack
-    /// under the dotnet root.
+    /// Bundles while an existing, empty DOTNET_ROOT hides every installed host pack. The
+    /// generated child runs only after the original value is restored. This proves the
+    /// template came from PEPacker's resource rather than merely omitting an explicit path
+    /// and accidentally finding the runner's SDK.
     /// </summary>
-    private static string? FindAppHostTemplate(out string source)
+    private static BundleResult BundleWithDotNetRootHidden(BundleRequest request)
     {
-        var fromPack = AppHostGenerator.FindAppHostTemplate();
-        if (fromPack is not null)
+        string emptyRoot = Path.Combine(_work, "empty-dotnet-root");
+        Directory.CreateDirectory(emptyRoot);
+        string? previous = Environment.GetEnvironmentVariable("DOTNET_ROOT");
+        Environment.SetEnvironmentVariable("DOTNET_ROOT", emptyRoot);
+        try
         {
-            source = "installed host pack";
-            return fromPack;
+            return AppHostGenerator.CreateSingleFileExecutable(request, BundlerMode.BuiltIn);
         }
-
-        source = "NuGet cache";
-        var rid = RuntimeInformation.RuntimeIdentifier;
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var packageRoot = Environment.GetEnvironmentVariable("NUGET_PACKAGES")
-            ?? Path.Combine(home, ".nuget", "packages");
-        var packageDir = Path.Combine(packageRoot, $"microsoft.netcore.app.host.{rid}");
-
-        if (!Directory.Exists(packageDir))
+        finally
         {
-            source = "not found";
-            return null;
+            Environment.SetEnvironmentVariable("DOTNET_ROOT", previous);
         }
-
-        var name = OperatingSystem.IsWindows() ? "apphost.exe" : "apphost";
-        var candidates = Directory.GetDirectories(packageDir)
-            .Select(v => Path.Combine(v, "runtimes", rid, "native", name))
-            .Where(File.Exists)
-            .OrderByDescending(p => p)
-            .ToList();
-
-        if (candidates.Count == 0)
-        {
-            source = "not found";
-            return null;
-        }
-
-        return candidates[0];
     }
 
     /// <summary>
