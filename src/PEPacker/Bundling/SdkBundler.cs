@@ -60,8 +60,9 @@ public class SdkBundler : IBundler
             var bundleDllPath = Path.Combine(tempBundleDir, $"{assemblyName}.dll");
             File.Copy(dllPath, bundleDllPath);
 
-            // Generate runtimeconfig.json
-            var runtimeConfigContent = GenerateRuntimeConfigJson(sdkVersion);
+            // Generate runtimeconfig.json. The apphost pack version (sdkVersion) describes the
+            // PE stub, not the framework the bundle needs, so it is not used here.
+            var runtimeConfigContent = RuntimeConfig.Generate();
             var runtimeConfigPath = Path.Combine(tempBundleDir, $"{assemblyName}.runtimeconfig.json");
             File.WriteAllText(runtimeConfigPath, runtimeConfigContent);
 
@@ -408,24 +409,5 @@ public class SdkBundler : IBundler
         }
 
         createAppHostMethod.Invoke(null, args);
-    }
-
-    private static string GenerateRuntimeConfigJson(Version _)
-    {
-        // Use the actual running runtime version, not the SDK version from the apphost template.
-        // The apphost template is version-agnostic (just a PE stub), but the runtimeconfig.json
-        // must reference a runtime version that is actually installed on the target machine.
-        var rv = Environment.Version;
-        return $$"""
-            {
-              "runtimeOptions": {
-                "tfm": "net{{rv.Major}}.{{rv.Minor}}",
-                "framework": {
-                  "name": "Microsoft.NETCore.App",
-                  "version": "{{rv.Major}}.{{rv.Minor}}.{{rv.Build}}"
-                }
-              }
-            }
-            """;
     }
 }
