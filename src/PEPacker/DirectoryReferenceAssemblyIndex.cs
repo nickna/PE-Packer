@@ -74,7 +74,7 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
                 RequiredReferenceDirectoryHint);
         }
 
-        foreach (var assemblyPath in assemblies)
+        foreach (var assemblyPath in InIndexingOrder(assemblies))
         {
             Index(assemblyPath);
         }
@@ -116,6 +116,39 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
         "(dotnet/packs/Microsoft.NETCore.App.Ref/<version>/ref/<tfm>). Note that under Native AOT, " +
         "RuntimeEnvironment.GetRuntimeDirectory() returns the running application's own directory, " +
         "which holds no framework assemblies and is not a valid value here.";
+
+    /// <summary>
+    /// Umbrella facades that forward most of the framework. They are indexed first so a
+    /// specific facade overwrites them for any type both describe.
+    /// </summary>
+    /// <remarks>
+    /// A shared framework directory contains <c>mscorlib</c>, <c>netstandard</c> and
+    /// <c>System</c> alongside the granular facades, and all of them forward
+    /// <c>Dictionary&lt;,&gt;</c>. Since indexing is last-wins, whichever came last in
+    /// <see cref="Directory.GetFiles(string, string)"/> order decided the answer — and that
+    /// order is alphabetical on Windows but filesystem order on Linux. The same assembly
+    /// therefore retargeted to <c>System.Collections</c> on one platform and <c>mscorlib</c> on
+    /// the other. Both resolve at run time, so nothing failed; the output simply was not
+    /// reproducible across machines.
+    /// </remarks>
+    private static readonly string[] UmbrellaFacades = ["mscorlib", "netstandard", "System"];
+
+    /// <summary>
+    /// Orders the files so indexing is deterministic and prefers specific facades.
+    /// </summary>
+    private static IEnumerable<string> InIndexingOrder(string[] assemblies)
+    {
+        // Ordinal by file name first, so the result never depends on directory enumeration
+        // order; then umbrellas ahead of everything else so specific facades win.
+        return assemblies
+            .OrderBy(p => IsUmbrella(p) ? 0 : 1)
+            .ThenBy(Path.GetFileName, StringComparer.Ordinal);
+
+        static bool IsUmbrella(string path) =>
+            Array.Exists(
+                UmbrellaFacades,
+                u => string.Equals(Path.GetFileNameWithoutExtension(path), u, StringComparison.OrdinalIgnoreCase));
+    }
 
     /// <summary>
     /// Number of indexed types. Exposed so a caller can report what a directory yielded.

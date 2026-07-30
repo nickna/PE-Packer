@@ -171,6 +171,39 @@ public class ReferenceAssemblyIndexTests
         }
     }
 
+    /// <summary>
+    /// A type forwarded by several facades must resolve to the specific one, on every platform.
+    /// </summary>
+    /// <remarks>
+    /// A shared framework holds <c>mscorlib</c>, <c>netstandard</c> and <c>System</c> alongside
+    /// the granular facades, and all of them forward these types. Indexing is last-wins, so
+    /// whichever file came last in directory-enumeration order used to decide — alphabetical on
+    /// Windows, filesystem order on Linux. The identical assembly retargeted to
+    /// <c>System.Collections</c> on one platform and <c>mscorlib</c> on the other, which was
+    /// caught only by running the Native AOT smoke host on linux-x64. Both resolve at run time,
+    /// so nothing failed; the output simply was not reproducible.
+    /// </remarks>
+    [Fact]
+    public void DirectoryIndex_PrefersSpecificFacades_OverUmbrellaOnes()
+    {
+        foreach (var dir in ReferenceDirectories())
+        {
+            var index = new DirectoryReferenceAssemblyIndex(dir);
+
+            foreach (var (type, expected) in new[]
+            {
+                ("System.Collections.Generic.Dictionary`2", "System.Collections"),
+                ("System.Collections.Generic.List`1", "System.Collections"),
+                ("System.Object", "System.Runtime"),
+                ("System.Console", "System.Console"),
+            })
+            {
+                Assert.True(index.TryResolveType(type, out var owner), $"{type} unresolved in {dir}");
+                Assert.Equal(expected, owner.Name);
+            }
+        }
+    }
+
     [Fact]
     public void DirectoryIndex_MissingDirectory_ThrowsPEPackerException()
     {
