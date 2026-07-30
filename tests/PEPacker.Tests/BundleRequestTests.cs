@@ -4,6 +4,7 @@ using System.Reflection.Emit;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
+using System.Runtime.InteropServices;
 using PEPacker.Bundling;
 using Xunit;
 
@@ -23,6 +24,9 @@ public class BundleRequestTests : IDisposable
 {
     private readonly string _work = Directory.CreateTempSubdirectory("pepacker_bundle_").FullName;
 
+    /// <summary>Executable suffix for the running platform.</summary>
+    private static string ExeSuffix => OperatingSystem.IsWindows() ? ".exe" : string.Empty;
+
     public void Dispose()
     {
         try { Directory.Delete(_work, recursive: true); } catch { /* best effort */ }
@@ -36,15 +40,11 @@ public class BundleRequestTests : IDisposable
     [Fact]
     public void MultiAssemblyBundle_Executes_WithNoDepsJson()
     {
-        if (!AppHostAvailable(out var skipReason))
-        {
-            Assert.Contains("apphost", skipReason);
-            return;
-        }
+        var apphost = RequireAppHost();
 
         var libPath = EmitLibrary("ProbeLib");
         var appPath = EmitAppCalling(libPath, "ProbeApp");
-        var exePath = Path.Combine(_work, "out", "ProbeApp.exe");
+        var exePath = Path.Combine(_work, "out", "ProbeApp" + ExeSuffix);
 
         var result = AppHostGenerator.CreateSingleFileExecutable(new BundleRequest
         {
@@ -52,6 +52,7 @@ public class BundleRequestTests : IDisposable
             OutputPath = exePath,
             AssemblyName = "ProbeApp",
             AdditionalAssemblies = [libPath],
+            AppHostTemplatePath = apphost,
         }, BundlerMode.BuiltIn);
 
         Assert.Equal(exePath, result.OutputPath);
@@ -70,20 +71,18 @@ public class BundleRequestTests : IDisposable
     [Fact]
     public void Bundle_OmittingARequiredAssembly_FailsAtRunTime()
     {
-        if (!AppHostAvailable(out _))
-        {
-            return;
-        }
+        var apphost = RequireAppHost();
 
         var libPath = EmitLibrary("ProbeLib");
         var appPath = EmitAppCalling(libPath, "ProbeApp");
-        var exePath = Path.Combine(_work, "control", "ProbeApp.exe");
+        var exePath = Path.Combine(_work, "control", "ProbeApp" + ExeSuffix);
 
         AppHostGenerator.CreateSingleFileExecutable(new BundleRequest
         {
             EntryAssemblyPath = appPath,
             OutputPath = exePath,
             AssemblyName = "ProbeApp",
+            AppHostTemplatePath = apphost,
             // AdditionalAssemblies deliberately empty.
         }, BundlerMode.BuiltIn);
 
@@ -196,13 +195,10 @@ public class BundleRequestTests : IDisposable
     [Fact]
     public void FrameworkVersionAndRollForward_ReachTheBundledRuntimeConfig()
     {
-        if (!AppHostAvailable(out _))
-        {
-            return;
-        }
+        var apphost = RequireAppHost();
 
         var libPath = EmitLibrary("ProbeLib");
-        var exePath = Path.Combine(_work, "cfg", "ProbeLib.exe");
+        var exePath = Path.Combine(_work, "cfg", "ProbeLib" + ExeSuffix);
 
         new ManualBundler().CreateSingleFileExecutable(new BundleRequest
         {
@@ -211,6 +207,7 @@ public class BundleRequestTests : IDisposable
             AssemblyName = "ProbeLib",
             FrameworkVersion = new Version(9, 3, 7),
             RollForward = RollForwardPolicy.LatestPatch,
+            AppHostTemplatePath = apphost,
         });
 
         var text = System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(exePath));
@@ -227,14 +224,11 @@ public class BundleRequestTests : IDisposable
     [Fact]
     public void EveryEmbeddedAssembly_IsPageAligned()
     {
-        if (!AppHostAvailable(out _))
-        {
-            return;
-        }
+        var apphost = RequireAppHost();
 
         var libPath = EmitLibrary("ProbeLib");
         var appPath = EmitAppCalling(libPath, "ProbeApp");
-        var exePath = Path.Combine(_work, "align", "ProbeApp.exe");
+        var exePath = Path.Combine(_work, "align", "ProbeApp" + ExeSuffix);
 
         new ManualBundler().CreateSingleFileExecutable(new BundleRequest
         {
@@ -242,6 +236,7 @@ public class BundleRequestTests : IDisposable
             OutputPath = exePath,
             AssemblyName = "ProbeApp",
             AdditionalAssemblies = [libPath],
+            AppHostTemplatePath = apphost,
         });
 
         var bytes = File.ReadAllBytes(exePath);
@@ -272,27 +267,64 @@ public class BundleRequestTests : IDisposable
         return -1;
     }
 
-    private static bool AppHostAvailable(out string reason)
+    /// <summary>
+    /// Returns an apphost template, or skips the calling test.
+    /// </summary>
+    /// <remarks>
+    /// Previously this returned a bool and callers quietly returned early, so a test named
+    /// <c>MultiAssemblyBundle_Executes_...</c> reported <em>Passed</em> in an environment where it
+    /// had bundled nothing. That is worse than having no test: it reads as coverage. Skipping
+    /// makes the gap visible in the run summary, and the NuGet-cache fallback means it is rarely
+    /// needed — the pack is often restored without being installed under the dotnet root.
+    /// </remarks>
+    private static string RequireAppHost()
     {
-        var path = AppHostGenerator.FindAppHostTemplate();
-        if (path is not null)
+        var fromPack = AppHostGenerator.FindAppHostTemplate();
+        if (fromPack is not null)
         {
-            reason = string.Empty;
-            return true;
+            return fromPack;
         }
 
-        // No host pack on this machine. Assert the bundler says so clearly instead of silently
-        // passing, so the test still means something where the pack is absent.
-        var ex = Assert.Throws<PEPackerException>(() => new ManualBundler().CreateSingleFileExecutable(
-            new BundleRequest
-            {
-                EntryAssemblyPath = typeof(BundleRequestTests).Assembly.Location,
-                OutputPath = Path.Combine(Path.GetTempPath(), "never.exe"),
-                AssemblyName = "never",
-            }));
+        var fromCache = FindAppHostInNuGetCache();
+        if (fromCache is not null)
+        {
+            return fromCache;
+        }
 
-        reason = ex.Message;
-        return false;
+        // Deliberately a failure rather than a quiet pass. An apphost is present in every
+        // environment this suite is expected to run in -- verified on Windows, on the ubuntu CI
+        // runner, and on linux-arm64 -- so its absence means bundling is not being covered, and
+        // that should be visible rather than inferred from a suspiciously fast "Passed".
+        Assert.Fail(
+            $"No apphost template for '{RuntimeInformation.RuntimeIdentifier}' under the dotnet " +
+            "root or in the NuGet cache, so bundling cannot be exercised. Install the .NET SDK, " +
+            $"or restore the Microsoft.NETCore.App.Host.{RuntimeInformation.RuntimeIdentifier} " +
+            "package so it lands in the NuGet cache.");
+
+        throw new InvalidOperationException("unreachable: Assert.Fail always throws");
+    }
+
+    /// <summary>
+    /// Looks for a restored-but-not-installed host pack.
+    /// </summary>
+    private static string? FindAppHostInNuGetCache()
+    {
+        var rid = RuntimeInformation.RuntimeIdentifier;
+        var root = Environment.GetEnvironmentVariable("NUGET_PACKAGES")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
+        var packageDir = Path.Combine(root, $"microsoft.netcore.app.host.{rid}");
+
+        if (!Directory.Exists(packageDir))
+        {
+            return null;
+        }
+
+        var name = OperatingSystem.IsWindows() ? "apphost.exe" : "apphost";
+        return Directory.GetDirectories(packageDir)
+            .Select(v => Path.Combine(v, "runtimes", rid, "native", name))
+            .Where(File.Exists)
+            .OrderByDescending(p => p, StringComparer.Ordinal)
+            .FirstOrDefault();
     }
 
     private (int ExitCode, string StdOut, string StdErr) Run(string exePath)
