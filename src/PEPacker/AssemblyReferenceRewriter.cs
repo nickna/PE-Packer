@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
@@ -113,11 +114,84 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private void BuildTypeToAssemblyMapping()
     {
         // Scan all reference assemblies to find where types are defined
+        if (!Directory.Exists(_refAssemblyPath))
+        {
+            throw new PEPackerException(
+                $"Reference assembly directory '{_refAssemblyPath}' does not exist. " +
+                RequiredReferenceDirectoryHint);
+        }
+
         var assemblies = Directory.GetFiles(_refAssemblyPath, "*.dll");
+        if (assemblies.Length == 0)
+        {
+            throw new PEPackerException(
+                $"Reference assembly directory '{_refAssemblyPath}' contains no .dll files. " +
+                RequiredReferenceDirectoryHint);
+        }
+
         var resolver = new PathAssemblyResolver(assemblies);
 
-        using var mlc = new MetadataLoadContext(resolver, "System.Runtime");
+        // Constructing the load context resolves the core assembly immediately, so a
+        // directory of unrelated DLLs fails here with a bare FileNotFoundException naming
+        // 'System.Runtime' and nothing about what was actually wanted.
+        MetadataLoadContext mlc;
+        try
+        {
+            mlc = new MetadataLoadContext(resolver, "System.Runtime");
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or FileLoadException
+                                      or BadImageFormatException)
+        {
+            throw new PEPackerException(
+                $"Reference assembly directory '{_refAssemblyPath}' holds {assemblies.Length} " +
+                ".dll file(s) but no usable 'System.Runtime', so the framework type map cannot be " +
+                $"built. {RequiredReferenceDirectoryHint}", ex);
+        }
 
+        using (mlc)
+        {
+            BuildTypeToAssemblyMapping(mlc, assemblies);
+        }
+
+        // An empty map is not a usable one: every CoreLib-scoped type reference would fall
+        // back to System.Runtime and no AssemblyRef row would carry a real identity, so the
+        // output would be quietly wrong rather than absent.
+        if (_typeToAssembly.Count == 0 || _assemblyInfoCache.Count == 0)
+        {
+            throw new PEPackerException(
+                $"Reference assembly directory '{_refAssemblyPath}' yielded no framework types " +
+                $"({assemblies.Length} .dll file(s) scanned). Rewriting would produce an assembly " +
+                $"with unresolved references. {RequiredReferenceDirectoryHint}");
+        }
+    }
+
+    /// <summary>
+    /// What a caller has to pass, and the one plausible value that silently is not it.
+    /// </summary>
+    /// <remarks>
+    /// Under Native AOT <c>RuntimeEnvironment.GetRuntimeDirectory()</c> returns the
+    /// application's own directory rather than the empty string, so the obvious way to
+    /// obtain this path degrades into "scan a folder with no framework assemblies in it".
+    /// </remarks>
+    private const string RequiredReferenceDirectoryHint =
+        "Expected a directory containing the framework assemblies — either a shared framework " +
+        "directory (dotnet/shared/Microsoft.NETCore.App/<version>) or a reference pack " +
+        "(dotnet/packs/Microsoft.NETCore.App.Ref/<version>/ref/<tfm>). Note that under Native AOT, " +
+        "RuntimeEnvironment.GetRuntimeDirectory() returns the running application's own directory, " +
+        "which holds no framework assemblies and is not a valid value here.";
+
+    /// <summary>
+    /// Populates the type and assembly maps from an already-resolved load context.
+    /// </summary>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
+        Justification =
+            "MetadataLoadContext is inspection-only: it reads types out of assembly files supplied " +
+            "at run time using its own type system, and never asks the runtime loader for anything. " +
+            "Trimming this application therefore cannot remove the types being enumerated here, so " +
+            "the warning does not apply. Verified working in a published Native AOT binary, which " +
+            "round-tripped an assembly through the full rewrite.")]
+    private void BuildTypeToAssemblyMapping(MetadataLoadContext mlc, string[] assemblies)
+    {
         foreach (var asmPath in assemblies)
         {
             try
