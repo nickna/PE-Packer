@@ -1,5 +1,26 @@
 # What PE-Packer needs for the SharpTS Native AOT variant
 
+> **Status: this document describes the state *before* the work, and is kept as the record of how
+> the conclusions were reached. It is no longer an accurate description of the code.**
+>
+> Phases A and B are complete and merged, along with Phase C's reference index and the test
+> coverage. Issue **#20** is the live status; this file is history.
+>
+> Specifically stale below: the analyzer warning count (13, now **0**), the
+> `System.Reflection.MetadataLoadContext` dependency (**removed**, replaced by `MetadataReader`),
+> the rewriter taking a directory path (**now an injected `IReferenceAssemblyIndex`**), the
+> single-assembly bundler limit (**`BundleRequest` now embeds several**), and the hardcoded
+> `SharpTS` reference drop (**now an injected `ReferencePolicy`**).
+>
+> Open questions 1, 2 and 3 are answered: a multi-assembly bundle needs **no** `.deps.json` (see
+> issue #18 for the evidence), the embedded index is **31.8 KB** compressed, and linux-x64 plus
+> linux-arm64 are both verified. Only `osx-arm64` remains untested, so the macOS guard in
+> `ManualBundler` is inferred rather than measured.
+>
+> One finding arrived after this was written and is not in the body at all: facade resolution used
+> to depend on directory enumeration order, so the same input retargeted to `System.Collections`
+> on Windows and `mscorlib` on Linux. Fixed; see PR #30.
+
 _Written July 29, 2026, against `D:\native-aot-variant.md` (SharpTS AOT feasibility plan)._
 
 Measurements tagged **[M]** were taken by publishing a real Native AOT probe that

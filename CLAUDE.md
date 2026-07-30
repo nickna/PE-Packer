@@ -19,6 +19,38 @@ dotnet test PE-Packer.slnx --filter "FullyQualifiedName~AssemblyReferenceRewrite
 dotnet test PE-Packer.slnx --filter "DisplayName~Rewrite_PreservesEntryPoint"
 ```
 
+### Native AOT smoke host
+
+`tests/PEPacker.AotSmoke` drives the full pipeline from inside a published native binary. The
+xUnit suite can never do this — it loads emitted assemblies in-process, so it must stay managed,
+which makes the whole "works under JIT, breaks under AOT" class invisible to it.
+
+```bash
+dotnet publish tests/PEPacker.AotSmoke/PEPacker.AotSmoke.csproj -c Release -r <rid>
+./tests/PEPacker.AotSmoke/bin/Release/net10.0/<rid>/publish/PEPacker.AotSmoke
+```
+
+It prints one line per check and exits non-zero if a required step failed. On Windows,
+`vswhere.exe` must be on `PATH` or ILC's link step fails with `MSB3073`; prepend
+`C:\Program Files (x86)\Microsoft Visual Studio\Installer`. On Linux it needs `clang` and
+`zlib1g-dev`.
+
+### Regenerating the embedded reference index
+
+`src/PEPacker/Resources/refindex-net10.0.bin` is the precomputed framework type map behind
+`EmbeddedReferenceAssemblyIndex` (31.8 KB, 4884 types, 167 assemblies). Regenerate it from a
+reference pack — not a shared framework, which forwards to `System.Private.CoreLib` instead of
+defining types:
+
+```bash
+dotnet run --project tools/PEPacker.RefIndexGen -- \
+  "<dotnet-root>/packs/Microsoft.NETCore.App.Ref/<version>/ref/net10.0" \
+  src/PEPacker/Resources/refindex-net10.0.bin
+```
+
+`Write` is byte-for-byte reproducible for the same input, so regenerating against the same pack
+produces no diff. The tool verifies its own output round-trips identically before exiting.
+
 CI (`.github/workflows/ci.yml`) runs build + test on push/PR to `master`. Tagging `v*` triggers `publish.yml`, which packs and pushes to NuGet — the tag suffix becomes the package version (`v1.2.3` → `1.2.3`), overriding the `Version` in `Directory.Build.props`.
 
 ## Architecture
@@ -56,6 +88,33 @@ The rewriter is verified two independent ways (both in `tests/PEPacker.Tests/Inf
 
 `PEPacker.Tests` has `InternalsVisibleTo` access, so tests can reach internals like `SupportedTables`.
 
+### Native AOT: what is settled
+
+PE-Packer works inside a Native AOT host — verified end to end on win-arm64 and linux-x64
+(the CI `aot-smoke` job). Facts worth not rediscovering:
+
+- **`Assembly.LoadFrom` fails under AOT regardless of what is installed.** `SdkBundlerDetector`
+  catches it and reports unavailable, so `BundlerFactory` selects `ManualBundler`. Measured with
+  four SDKs present: it found `Microsoft.NET.HostModel.dll` on disk and still could not load it.
+  "Install the SDK" is never the right advice for that failure.
+- **`RuntimeEnvironment.GetRuntimeDirectory()` returns the application's own directory** under
+  AOT, on both Windows and Linux — not the empty string, so nothing looks wrong. Never use it to
+  locate reference assemblies. Use `EmbeddedReferenceAssemblyIndex` or an explicit path.
+- **`Environment.Version` reports the ILCompiler runtime pack** the tool was built against. It is
+  a build-machine artifact, which is why `RuntimeConfig` never emits a patch component.
+- **The analyzer surface is ratcheted at zero.** CI fails on any new `IL####` warning. Suppress
+  only with `[UnconditionalSuppressMessage]` and a justification that says why it is inapplicable.
+
+The remaining SDK dependency is the apphost template (issue #14). `BundleRequest.AppHostTemplatePath`
+is the escape hatch, and both the smoke host and the bundling tests use it.
+
+**Recurring bug class:** framework and pack directory names sorted as strings put `9.0.17` and
+`10.0.9` above `10.0.10`. This has been fixed three separate times (the original runtimeconfig
+pinning, the smoke host, and a test helper). Parse to `Version` before comparing.
+
 ## Conventions
 
 `Directory.Build.props` applies repo-wide: `Nullable` enabled, `ImplicitUsings` enabled, `LangVersion latest`, and a single shared `Version`. Throw `PEPackerException` for library-level failures.
+
+`AssemblyIdentity` overrides record equality on purpose: `ImmutableArray<T>` compares by reference,
+so the generated equality reported identical identities as unequal. Keep the by-value override.
