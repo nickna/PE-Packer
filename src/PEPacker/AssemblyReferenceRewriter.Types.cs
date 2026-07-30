@@ -27,7 +27,9 @@ public partial class AssemblyReferenceRewriter
                         if (_referencePolicy(oldAsmName) == ReferenceAction.RetargetToFacades)
                         {
                             // Redirect to appropriate SDK assembly
-                            var targetAsm = _typeToAssembly.GetValueOrDefault(fullName, "System.Runtime");
+                            var targetAsm = _referenceIndex.TryResolveType(fullName, out var owner)
+                                ? owner.Name
+                                : "System.Runtime";
                             newResolutionScope = _newAssemblyRefs.GetValueOrDefault(targetAsm,
                                 _newAssemblyRefs.GetValueOrDefault("System.Runtime", default));
                         }

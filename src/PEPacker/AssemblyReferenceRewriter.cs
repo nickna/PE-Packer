@@ -1,5 +1,3 @@
-using System.Diagnostics.CodeAnalysis;
-using System.Reflection;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
@@ -23,14 +21,13 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private readonly MetadataReader _reader;
     private readonly Stream _sourceStream;
 
-    // Reference assembly resolution
-    private readonly string _refAssemblyPath;
+    // Answers "which assembly owns this type" and "what is this assembly's identity".
+    // Was an eagerly scanned directory path plus two dictionaries built from it.
+    private readonly IReferenceAssemblyIndex _referenceIndex;
 
     // Decides keep/drop/retarget per assembly simple name. Was three hardcoded name
     // comparisons across .Assembly.cs and .Types.cs.
     private readonly Func<string, ReferenceAction> _referencePolicy;
-    private readonly Dictionary<string, string> _typeToAssembly = new(); // FullTypeName -> AssemblyName
-    private readonly Dictionary<string, AssemblyName> _assemblyInfoCache = new(); // AssemblyName -> AssemblyName object
 
     // Target assembly building
     private readonly MetadataBuilder _metadata = new();
@@ -89,34 +86,60 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Creates a new assembly reference rewriter using <see cref="ReferencePolicy.Default"/>.
+    /// Creates a rewriter that indexes <paramref name="refAssemblyPath"/> for framework
+    /// types, using <see cref="ReferencePolicy.Default"/>.
     /// </summary>
     /// <param name="sourceAssembly">Stream containing the compiled assembly to rewrite.</param>
-    /// <param name="refAssemblyPath">Path to SDK reference assemblies directory.</param>
+    /// <param name="refAssemblyPath">Directory of framework reference assemblies.</param>
     public AssemblyReferenceRewriter(Stream sourceAssembly, string refAssemblyPath)
-        : this(sourceAssembly, refAssemblyPath, ReferencePolicy.Default)
+        : this(sourceAssembly, new DirectoryReferenceAssemblyIndex(refAssemblyPath), ReferencePolicy.Default)
     {
     }
 
     /// <summary>
-    /// Creates a new assembly reference rewriter with an explicit reference policy.
+    /// Creates a rewriter that indexes <paramref name="refAssemblyPath"/> for framework
+    /// types, with an explicit reference policy.
     /// </summary>
     /// <param name="sourceAssembly">Stream containing the compiled assembly to rewrite.</param>
-    /// <param name="refAssemblyPath">Path to SDK reference assemblies directory.</param>
-    /// <param name="referencePolicy">
-    /// Decides, per assembly simple name, whether a reference is kept, dropped, or
-    /// retargeted onto the SDK facades. See <see cref="ReferencePolicy"/> for the
-    /// ready-made options.
-    /// </param>
+    /// <param name="refAssemblyPath">Directory of framework reference assemblies.</param>
+    /// <param name="referencePolicy">See <see cref="ReferencePolicy"/>.</param>
     public AssemblyReferenceRewriter(
         Stream sourceAssembly,
         string refAssemblyPath,
         Func<string, ReferenceAction> referencePolicy)
+        : this(sourceAssembly, new DirectoryReferenceAssemblyIndex(refAssemblyPath), referencePolicy)
     {
+    }
+
+    /// <summary>
+    /// Creates a rewriter over an arbitrary framework type index, using
+    /// <see cref="ReferencePolicy.Default"/>.
+    /// </summary>
+    /// <param name="sourceAssembly">Stream containing the compiled assembly to rewrite.</param>
+    /// <param name="referenceIndex">Supplies framework type ownership and assembly identities.</param>
+    public AssemblyReferenceRewriter(Stream sourceAssembly, IReferenceAssemblyIndex referenceIndex)
+        : this(sourceAssembly, referenceIndex, ReferencePolicy.Default)
+    {
+    }
+
+    /// <summary>
+    /// Creates a rewriter over an arbitrary framework type index with an explicit reference
+    /// policy. This is the overload that does not require framework assemblies on disk.
+    /// </summary>
+    /// <param name="sourceAssembly">Stream containing the compiled assembly to rewrite.</param>
+    /// <param name="referenceIndex">Supplies framework type ownership and assembly identities.</param>
+    /// <param name="referencePolicy">See <see cref="ReferencePolicy"/>.</param>
+    public AssemblyReferenceRewriter(
+        Stream sourceAssembly,
+        IReferenceAssemblyIndex referenceIndex,
+        Func<string, ReferenceAction> referencePolicy)
+    {
+        ArgumentNullException.ThrowIfNull(sourceAssembly);
+        ArgumentNullException.ThrowIfNull(referenceIndex);
         ArgumentNullException.ThrowIfNull(referencePolicy);
 
         _sourceStream = sourceAssembly;
-        _refAssemblyPath = refAssemblyPath;
+        _referenceIndex = referenceIndex;
         _referencePolicy = referencePolicy;
 
         _peReader = new PEReader(sourceAssembly);
@@ -128,161 +151,6 @@ public partial class AssemblyReferenceRewriter : IDisposable
         {
             _sourceEntryPoint = MetadataTokens.MethodDefinitionHandle(
                 corHeader.EntryPointTokenOrRelativeVirtualAddress);
-        }
-
-        BuildTypeToAssemblyMapping();
-    }
-
-    /// <summary>
-    /// Builds a mapping from type full names to their SDK reference assembly.
-    /// </summary>
-    private void BuildTypeToAssemblyMapping()
-    {
-        // Scan all reference assemblies to find where types are defined
-        if (!Directory.Exists(_refAssemblyPath))
-        {
-            throw new PEPackerException(
-                $"Reference assembly directory '{_refAssemblyPath}' does not exist. " +
-                RequiredReferenceDirectoryHint);
-        }
-
-        var assemblies = Directory.GetFiles(_refAssemblyPath, "*.dll");
-        if (assemblies.Length == 0)
-        {
-            throw new PEPackerException(
-                $"Reference assembly directory '{_refAssemblyPath}' contains no .dll files. " +
-                RequiredReferenceDirectoryHint);
-        }
-
-        var resolver = new PathAssemblyResolver(assemblies);
-
-        // Constructing the load context resolves the core assembly immediately, so a
-        // directory of unrelated DLLs fails here with a bare FileNotFoundException naming
-        // 'System.Runtime' and nothing about what was actually wanted.
-        MetadataLoadContext mlc;
-        try
-        {
-            mlc = new MetadataLoadContext(resolver, "System.Runtime");
-        }
-        catch (Exception ex) when (ex is FileNotFoundException or FileLoadException
-                                      or BadImageFormatException)
-        {
-            throw new PEPackerException(
-                $"Reference assembly directory '{_refAssemblyPath}' holds {assemblies.Length} " +
-                ".dll file(s) but no usable 'System.Runtime', so the framework type map cannot be " +
-                $"built. {RequiredReferenceDirectoryHint}", ex);
-        }
-
-        using (mlc)
-        {
-            BuildTypeToAssemblyMapping(mlc, assemblies);
-        }
-
-        // An empty map is not a usable one: every CoreLib-scoped type reference would fall
-        // back to System.Runtime and no AssemblyRef row would carry a real identity, so the
-        // output would be quietly wrong rather than absent.
-        if (_typeToAssembly.Count == 0 || _assemblyInfoCache.Count == 0)
-        {
-            throw new PEPackerException(
-                $"Reference assembly directory '{_refAssemblyPath}' yielded no framework types " +
-                $"({assemblies.Length} .dll file(s) scanned). Rewriting would produce an assembly " +
-                $"with unresolved references. {RequiredReferenceDirectoryHint}");
-        }
-    }
-
-    /// <summary>
-    /// What a caller has to pass, and the one plausible value that silently is not it.
-    /// </summary>
-    /// <remarks>
-    /// Under Native AOT <c>RuntimeEnvironment.GetRuntimeDirectory()</c> returns the
-    /// application's own directory rather than the empty string, so the obvious way to
-    /// obtain this path degrades into "scan a folder with no framework assemblies in it".
-    /// </remarks>
-    private const string RequiredReferenceDirectoryHint =
-        "Expected a directory containing the framework assemblies — either a shared framework " +
-        "directory (dotnet/shared/Microsoft.NETCore.App/<version>) or a reference pack " +
-        "(dotnet/packs/Microsoft.NETCore.App.Ref/<version>/ref/<tfm>). Note that under Native AOT, " +
-        "RuntimeEnvironment.GetRuntimeDirectory() returns the running application's own directory, " +
-        "which holds no framework assemblies and is not a valid value here.";
-
-    /// <summary>
-    /// Populates the type and assembly maps from an already-resolved load context.
-    /// </summary>
-    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
-        Justification =
-            "MetadataLoadContext is inspection-only: it reads types out of assembly files supplied " +
-            "at run time using its own type system, and never asks the runtime loader for anything. " +
-            "Trimming this application therefore cannot remove the types being enumerated here, so " +
-            "the warning does not apply. Verified working in a published Native AOT binary, which " +
-            "round-tripped an assembly through the full rewrite.")]
-    private void BuildTypeToAssemblyMapping(MetadataLoadContext mlc, string[] assemblies)
-    {
-        foreach (var asmPath in assemblies)
-        {
-            try
-            {
-                var asm = mlc.LoadFromAssemblyPath(asmPath);
-                var asmName = asm.GetName();
-                var name = asmName.Name!;
-
-                // Skip implementation assemblies
-                if (name == "System.Private.CoreLib")
-                    continue;
-
-                // Cache assembly info for later
-                _assemblyInfoCache[name] = asmName;
-
-                // Handle forwarded types. A facade routinely forwards to assemblies
-                // outside the probe directory; the exception still carries the entries
-                // that did resolve, so keep those instead of losing the whole facade.
-                Type?[] forwardedTypes;
-                try
-                {
-                    forwardedTypes = asm.GetForwardedTypes();
-                }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    forwardedTypes = ex.Types;
-                }
-
-                foreach (var forwardedType in forwardedTypes)
-                {
-                    if (forwardedType is { FullName: not null })
-                    {
-                        _typeToAssembly[forwardedType.FullName] = name;
-                    }
-                }
-
-                // Map all public types. A reference assembly may name types from
-                // assemblies outside the probe directory; ReflectionTypeLoadException
-                // still carries everything that did resolve, so take those rather than
-                // discarding the assembly's entire contribution.
-                Type?[] types;
-                try
-                {
-                    types = asm.GetTypes();
-                }
-                catch (ReflectionTypeLoadException ex)
-                {
-                    types = ex.Types;
-                }
-
-                foreach (var type in types)
-                {
-                    if (type is { FullName: not null } && (type.IsPublic || type.IsNestedPublic))
-                    {
-                        _typeToAssembly[type.FullName] = name;
-                    }
-                }
-            }
-            catch (Exception ex) when (ex is BadImageFormatException or FileLoadException
-                                          or FileNotFoundException)
-            {
-                // The probe directory holds native libraries alongside managed ones
-                // (clrjit, hostpolicy, ...), so these are expected and skipped. Anything
-                // else is a real fault and is left to propagate rather than degrading the
-                // type map without a word.
-            }
         }
     }
 
