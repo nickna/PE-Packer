@@ -68,7 +68,7 @@ public partial class AssemblyReferenceRewriter
                 var asmRef = _reader.GetAssemblyReference((AssemblyReferenceHandle)scope);
                 var asmName = _reader.GetString(asmRef.Name);
 
-                if (asmName == "System.Private.CoreLib")
+                if (_referencePolicy(asmName) == ReferenceAction.RetargetToFacades)
                 {
                     var typeName = GetFullTypeName(typeRef);
                     if (_typeToAssembly.TryGetValue(typeName, out var targetAsm))
@@ -112,13 +112,15 @@ public partial class AssemblyReferenceRewriter
             }
         }
 
-        // Copy existing assembly references (except System.Private.CoreLib and SharpTS)
+        // Copy the references the policy keeps. Both Drop and RetargetToFacades mean the
+        // source row is not reproduced: a retargeted reference is replaced by the facade
+        // rows created above, and a dropped one is simply absent.
         foreach (var asmRefHandle in _reader.AssemblyReferences)
         {
             var asmRef = _reader.GetAssemblyReference(asmRefHandle);
             var name = _reader.GetString(asmRef.Name);
 
-            if (name is "System.Private.CoreLib" or "SharpTS")
+            if (_referencePolicy(name) != ReferenceAction.Keep)
                 continue;
 
             // The facade set above may already have created a row for this name — the

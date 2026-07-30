@@ -25,6 +25,10 @@ public partial class AssemblyReferenceRewriter : IDisposable
 
     // Reference assembly resolution
     private readonly string _refAssemblyPath;
+
+    // Decides keep/drop/retarget per assembly simple name. Was three hardcoded name
+    // comparisons across .Assembly.cs and .Types.cs.
+    private readonly Func<string, ReferenceAction> _referencePolicy;
     private readonly Dictionary<string, string> _typeToAssembly = new(); // FullTypeName -> AssemblyName
     private readonly Dictionary<string, AssemblyName> _assemblyInfoCache = new(); // AssemblyName -> AssemblyName object
 
@@ -85,14 +89,35 @@ public partial class AssemblyReferenceRewriter : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Creates a new assembly reference rewriter.
+    /// Creates a new assembly reference rewriter using <see cref="ReferencePolicy.Default"/>.
     /// </summary>
     /// <param name="sourceAssembly">Stream containing the compiled assembly to rewrite.</param>
     /// <param name="refAssemblyPath">Path to SDK reference assemblies directory.</param>
     public AssemblyReferenceRewriter(Stream sourceAssembly, string refAssemblyPath)
+        : this(sourceAssembly, refAssemblyPath, ReferencePolicy.Default)
     {
+    }
+
+    /// <summary>
+    /// Creates a new assembly reference rewriter with an explicit reference policy.
+    /// </summary>
+    /// <param name="sourceAssembly">Stream containing the compiled assembly to rewrite.</param>
+    /// <param name="refAssemblyPath">Path to SDK reference assemblies directory.</param>
+    /// <param name="referencePolicy">
+    /// Decides, per assembly simple name, whether a reference is kept, dropped, or
+    /// retargeted onto the SDK facades. See <see cref="ReferencePolicy"/> for the
+    /// ready-made options.
+    /// </param>
+    public AssemblyReferenceRewriter(
+        Stream sourceAssembly,
+        string refAssemblyPath,
+        Func<string, ReferenceAction> referencePolicy)
+    {
+        ArgumentNullException.ThrowIfNull(referencePolicy);
+
         _sourceStream = sourceAssembly;
         _refAssemblyPath = refAssemblyPath;
+        _referencePolicy = referencePolicy;
 
         _peReader = new PEReader(sourceAssembly);
         _reader = _peReader.GetMetadataReader();
