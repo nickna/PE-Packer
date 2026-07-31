@@ -51,7 +51,7 @@ dotnet run --project tools/PEPacker.RefIndexGen -- \
 `Write` is byte-for-byte reproducible for the same input, so regenerating against the same pack
 produces no diff. The tool verifies its own output round-trips identically before exiting.
 
-CI (`.github/workflows/ci.yml`) runs build + test on push/PR to `master`. Tagging `v*` triggers `publish.yml`, which packs and pushes to NuGet — the tag suffix becomes the package version (`v1.2.3` → `1.2.3`), overriding the `Version` in `Directory.Build.props`.
+CI (`.github/workflows/ci.yml`) runs build + test on push/PR to `master`. Tagging `v*` triggers `publish.yml`, which re-runs the two AOT gates (the analyzer ratchet and the linux-x64 `aot-smoke`, since a tag can point at a commit that never went through master CI), then builds, packs, and pushes to NuGet — the tag suffix becomes the version (`v1.2.3` → `1.2.3`), passed to both build and pack so the shipped DLLs carry it too, overriding the `Version` in `Directory.Build.props`.
 
 ## Architecture
 
@@ -90,8 +90,8 @@ The rewriter is verified two independent ways (both in `tests/PEPacker.Tests/Inf
 
 ### Native AOT: what is settled
 
-PE-Packer works inside a Native AOT host — verified end to end on win-arm64 and linux-x64
-(the CI `aot-smoke` job). Facts worth not rediscovering:
+PE-Packer works inside a Native AOT host — verified end to end on linux-x64 (the CI
+`aot-smoke` job) and manually on win-arm64. Facts worth not rediscovering:
 
 - **`Assembly.LoadFrom` fails under AOT regardless of what is installed.** `SdkBundlerDetector`
   catches it and reports unavailable, so `BundlerFactory` selects `ManualBundler`. Measured with
@@ -120,8 +120,10 @@ AOT smoke temporarily points `DOTNET_ROOT` at an empty directory while bundling,
 embedded path rather than accidentally borrowing the runner's SDK.
 
 **Recurring bug class:** framework and pack directory names sorted as strings put `9.0.17` and
-`10.0.9` above `10.0.10`. This has been fixed three separate times (the original runtimeconfig
-pinning, the smoke host, and a test helper). Parse to `Version` before comparing.
+`10.0.9` above `10.0.10`. This has been fixed four separate times (the original runtimeconfig
+pinning, the smoke host, and two test helpers). All version parsing/comparison now goes through
+the internal `VersionUtil` (`src/PEPacker/VersionUtil.cs`, prerelease-aware, visible to both test
+projects via `InternalsVisibleTo`) — use it instead of writing another local parser.
 
 ## Conventions
 

@@ -28,7 +28,7 @@ Anything that emits assemblies at runtime and needs to ship them. The motivating
 - **Assembly Reference Rewriting** — Rewrites `System.Private.CoreLib` references to SDK reference assemblies (`System.Runtime`, `System.Collections`, etc.). Handles generics, nested types, method specs, properties, events, P/Invoke, custom attributes and IL token patching. Refuses input it cannot reproduce faithfully rather than emitting a lossy assembly — see [Scope and limitations](#scope-and-limitations).
 - **Single-File Bundling** — Creates single-file .NET executables. Automatically selects the SDK bundler when available, falls back to the built-in bundler. Windows and Linux apphost templates are embedded, so built-in bundling does not require an installed SDK.
 - **App Host Generation** — Generates standalone executable wrappers around .NET DLLs with proper runtime configuration.
-- **Native AOT support** — The library runs inside Native AOT-published applications, verified end to end in CI on win-arm64 and linux-x64. A feature switch lets AOT consumers compile out the SDK-bundler path entirely.
+- **Native AOT support** — The library runs inside Native AOT-published applications, verified end to end on linux-x64 in CI and manually on win-arm64. A feature switch lets AOT consumers compile out the SDK-bundler path entirely.
 
 ## Requirements
 
@@ -45,21 +45,42 @@ dotnet add package NickNa.PEPacker
 
 ### Assembly Reference Rewriting
 
+The recommended constructor takes an `IReferenceAssemblyIndex`. The package ships one — `EmbeddedReferenceAssemblyIndex` — with the net10.0 framework type map precompiled into `PEPacker.dll`, so rewriting needs no SDK, no reference pack, and nothing else on disk. This is also the AOT-safe path: it's what makes the rewriter work from inside a Native AOT binary on a machine with no .NET installed.
+
 ```csharp
 using PEPacker;
 
 // sourceAssembly: a compiled DLL with System.Private.CoreLib references
-// refAssemblyPath: path to SDK ref assemblies, e.g.:
-//   C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\10.0.0\ref\net10.0
 using var sourceStream = File.OpenRead("compiled.dll");
-using var rewriter = new AssemblyReferenceRewriter(sourceStream, refAssemblyPath);
+using var rewriter = new AssemblyReferenceRewriter(
+    sourceStream,
+    EmbeddedReferenceAssemblyIndex.Default,        // precomputed net10.0 index, nothing needed on disk
+    ReferencePolicy.RetargetCoreLibOnly);          // see "Reference policy" below
 rewriter.Rewrite();
 
 using var output = File.Create("rewritten.dll");
 rewriter.Save(output);
 ```
 
+`EmbeddedReferenceAssemblyIndex.Default` covers `net10.0` (the value of `EmbeddedReferenceAssemblyIndex.EmbeddedTargetFramework`). `EmbeddedReferenceAssemblyIndex.ForTargetFramework("net10.0")` returns the same index and throws a `PEPackerException` for any other TFM rather than silently emitting the wrong facade versions — facade versions are part of the data, so an index must match the framework the rewritten assembly targets. For a framework this package doesn't embed, generate your own index with `EmbeddedReferenceAssemblyIndex.Write` over a `DirectoryReferenceAssemblyIndex` built from that framework's reference pack, and load it back with the `EmbeddedReferenceAssemblyIndex(Stream)` constructor.
+
+Alternatively, if you have a reference pack on disk (or want to rewrite against a custom one), pass its directory instead of an index:
+
+```csharp
+// refAssemblyPath: path to SDK ref assemblies, e.g.:
+//   C:\Program Files\dotnet\packs\Microsoft.NETCore.App.Ref\10.0.0\ref\net10.0
+using var rewriter = new AssemblyReferenceRewriter(sourceStream, refAssemblyPath);
+```
+
+This overload scans the directory at construction, so it requires the assemblies to actually be there — under Native AOT prefer the embedded index, and never locate the directory via `RuntimeEnvironment.GetRuntimeDirectory()` (under AOT it returns the application's own directory, not a framework).
+
 `Rewrite()` throws `PEPackerException` if the source uses metadata the rewriter does not reproduce. The message names each offending construct and how many rows it has, so the failure points at the feature rather than a table number.
+
+#### Reference policy
+
+The rewriter consults a policy — a `Func<string, ReferenceAction>` keyed by assembly simple name — to decide what happens to each assembly reference in the source: `Keep` it verbatim, `Drop` it, or `RetargetToFacades` (resolve its types against the SDK facades, which is the whole point for `System.Private.CoreLib`).
+
+Constructors that don't take a policy use `ReferencePolicy.Default`, which retargets `System.Private.CoreLib`, **silently drops any reference named `SharpTS`**, and keeps everything else. The SharpTS entry is compatibility, not design: it preserves the behavior of releases up to 1.0.4 for [SharpTS](https://github.com/nickna/SharpTS), which uses that reference as its marker for whether a rewrite is needed — stripping it is the point of the pass there. Unless you are SharpTS, pass `ReferencePolicy.RetargetCoreLibOnly` (retarget CoreLib, keep everything else) or your own delegate; `ReferencePolicy.DroppingReferences("MyEmitHelper", ...)` builds a policy that additionally drops named assemblies. A type reference scoped to a dropped assembly is reported as an error rather than silently nulled.
 
 ### Single-File Bundling
 
@@ -107,8 +128,8 @@ var result = AppHostGenerator.CreateSingleFileExecutable(
 
 PE Packer works when the *consuming application* is published with Native AOT — a native
 compiler or CLI tool can rewrite and bundle assemblies without carrying a JIT runtime. This is
-exercised end to end in CI (win-arm64 and linux-x64) by a dedicated smoke host that runs the
-full pipeline from inside a published native binary.
+exercised end to end by a dedicated smoke host that runs the full pipeline from inside a
+published native binary — on linux-x64 in CI, and verified manually on win-arm64.
 
 The SDK bundler relies on dynamic assembly loading, which Native AOT cannot do, so AOT
 applications should compile that path out with the feature switch:
