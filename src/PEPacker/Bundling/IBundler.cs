@@ -82,6 +82,13 @@ public interface IBundler
     /// <param name="exePath">Path for the output executable (.exe).</param>
     /// <param name="assemblyName">Name of the assembly (without extension).</param>
     /// <returns>Result containing output path and technique used.</returns>
+    /// <remarks>
+    /// Implemented once, here. <see cref="ManualBundler"/> and <see cref="FallbackBundler"/> each
+    /// carried a byte-for-byte copy of this body, so a change to the defaults would have had to be
+    /// made in three places to take effect everywhere. Being a default interface method it is
+    /// reached through the interface, which is how <c>AppHostGenerator</c> and
+    /// <see cref="BundlerFactory"/> hand bundlers out.
+    /// </remarks>
     BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName) =>
         CreateSingleFileExecutable(new BundleRequest
         {

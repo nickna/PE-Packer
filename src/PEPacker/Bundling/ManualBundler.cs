@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
@@ -61,6 +62,7 @@ public class ManualBundler : IBundler
 
         var rid = request.RuntimeIdentifier ?? GetCurrentRuntimeIdentifier();
         GuardUnsupportedTarget(rid);
+        RequireEntryAssembly(request.EntryAssemblyPath);
 
         if (!request.Overwrite && File.Exists(request.OutputPath))
         {
@@ -101,13 +103,7 @@ public class ManualBundler : IBundler
         try
         {
             WriteBundle(request, tempPath, apphostBytes, headerOffsetIndex, embedded, runtimeConfigBytes);
-
-            if (File.Exists(request.OutputPath))
-            {
-                File.Delete(request.OutputPath);
-            }
-
-            File.Move(tempPath, request.OutputPath);
+            MoveIntoPlace(tempPath, request.OutputPath, request.Overwrite);
         }
         catch
         {
@@ -120,14 +116,28 @@ public class ManualBundler : IBundler
         return new BundleResult(request.OutputPath, BundleTechnique.ManualBundler);
     }
 
-    /// <inheritdoc/>
-    public BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName) =>
-        CreateSingleFileExecutable(new BundleRequest
+    // The (dllPath, exePath, assemblyName) convenience overload is the default interface method
+    // on IBundler. It was duplicated here byte-for-byte, which is one more place for the defaults
+    // it applies to drift.
+
+    /// <summary>
+    /// Rejects an entry assembly that is not there, rather than letting the read fail deep in
+    /// the bundle writer.
+    /// </summary>
+    /// <remarks>
+    /// Every other input — the apphost template, each additional assembly — is checked before
+    /// any work happens and reported as a <see cref="PEPackerException"/>. A missing entry
+    /// assembly instead surfaced as a raw <see cref="FileNotFoundException"/> from the streaming
+    /// copy, after the output temp file had already been created.
+    /// </remarks>
+    private static void RequireEntryAssembly(string entryAssemblyPath)
+    {
+        if (string.IsNullOrEmpty(entryAssemblyPath) || !File.Exists(entryAssemblyPath))
         {
-            EntryAssemblyPath = dllPath,
-            OutputPath = exePath,
-            AssemblyName = assemblyName
-        });
+            throw new PEPackerException(
+                $"BundleRequest.EntryAssemblyPath '{entryAssemblyPath}' does not exist.");
+        }
+    }
 
     /// <summary>
     /// Writes <c>[apphost][file data...][manifest]</c>, then patches the manifest offset back
@@ -201,8 +211,12 @@ public class ManualBundler : IBundler
             }
         }
 
+        // Explicitly little-endian, like every other field above: the bundle format is
+        // little-endian regardless of the machine writing it, and BitConverter is not.
         stream.Position = headerOffsetIndex;
-        stream.Write(BitConverter.GetBytes(manifestOffset));
+        Span<byte> manifestOffsetBytes = stackalloc byte[sizeof(long)];
+        BinaryPrimitives.WriteInt64LittleEndian(manifestOffsetBytes, manifestOffset);
+        stream.Write(manifestOffsetBytes);
         stream.Flush();
     }
 
@@ -437,7 +451,7 @@ public class ManualBundler : IBundler
     /// </summary>
     internal static (string? Path, Version? Version) FindAppHostTemplateWithVersion(string rid)
     {
-        var dotnetRoot = GetDotNetRoot();
+        var dotnetRoot = DotNetRoot.Find();
         if (dotnetRoot == null) return (null, null);
 
         var packsDir = Path.Combine(dotnetRoot, "packs");
@@ -451,83 +465,128 @@ public class ManualBundler : IBundler
 
         if (hostPackDirs.Count == 0) return (null, null);
 
-        // Find highest available version (prefer newer SDKs)
+        // Find highest available version (prefer newer SDKs). Parsed, never compared as a
+        // string: "10.0.9" sorts above "10.0.10" as text.
         string? bestPath = null;
-        Version? bestVersion = null;
+        VersionUtil.Parsed? bestVersion = null;
 
         foreach (var packDir in hostPackDirs)
         {
             foreach (var versionDir in Directory.GetDirectories(packDir))
             {
-                var versionStr = Path.GetFileName(versionDir);
-                var dashIndex = versionStr.IndexOf('-');
-                var cleanVersion = dashIndex > 0 ? versionStr[..dashIndex] : versionStr;
-
-                if (Version.TryParse(cleanVersion, out var version))
+                if (!VersionUtil.TryParse(Path.GetFileName(versionDir), out var version))
                 {
-                    if (bestVersion == null || version > bestVersion)
-                    {
-                        // The template's own extension follows the target, not the host.
-                        var exeName = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase)
-                            ? "apphost.exe"
-                            : "apphost";
-                        var apphostPath = Path.Combine(versionDir, "runtimes", rid, "native", exeName);
-                        if (File.Exists(apphostPath))
-                        {
-                            bestVersion = version;
-                            bestPath = apphostPath;
-                        }
-                    }
+                    continue;
+                }
+
+                if (bestVersion is not null && version <= bestVersion.Value)
+                {
+                    continue;
+                }
+
+                // The template's own extension follows the target, not the host.
+                var exeName = rid.StartsWith("win", StringComparison.OrdinalIgnoreCase)
+                    ? "apphost.exe"
+                    : "apphost";
+                var apphostPath = Path.Combine(versionDir, "runtimes", rid, "native", exeName);
+                if (File.Exists(apphostPath))
+                {
+                    bestVersion = version;
+                    bestPath = apphostPath;
                 }
             }
         }
 
-        return (bestPath, bestVersion);
+        return (bestPath, bestVersion?.Version);
     }
 
-    private static string? GetDotNetRoot()
+    /// <summary>
+    /// The runtime identifier for the machine this is running on.
+    /// </summary>
+    /// <exception cref="PEPackerException">
+    /// The current OS or architecture is not one that maps to a RID PEPacker can bundle for.
+    /// </exception>
+    internal static string GetCurrentRuntimeIdentifier() =>
+        BuildRuntimeIdentifier(CurrentOSMoniker(), RuntimeInformation.OSArchitecture);
+
+    /// <summary>
+    /// The RID OS portion for the running platform, or <see langword="null"/> when it is not one
+    /// of the three PEPacker knows how to name.
+    /// </summary>
+    private static string? CurrentOSMoniker()
     {
-        var dotnetRoot = Environment.GetEnvironmentVariable("DOTNET_ROOT");
-        if (!string.IsNullOrEmpty(dotnetRoot) && Directory.Exists(dotnetRoot))
-        {
-            return dotnetRoot;
-        }
-
-        if (OperatingSystem.IsWindows())
-        {
-            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-            var path = Path.Combine(programFiles, "dotnet");
-            if (Directory.Exists(path)) return path;
-        }
-        else
-        {
-            var homeDotnet = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dotnet");
-            var paths = new[] { "/usr/share/dotnet", "/usr/local/share/dotnet", "/opt/dotnet", homeDotnet };
-            foreach (var path in paths)
-            {
-                if (Directory.Exists(path)) return path;
-            }
-        }
-
+        if (OperatingSystem.IsWindows()) return "win";
+        if (OperatingSystem.IsLinux()) return "linux";
+        if (OperatingSystem.IsMacOS()) return "osx";
         return null;
     }
 
-    internal static string GetCurrentRuntimeIdentifier()
+    /// <summary>
+    /// Joins an OS moniker and an architecture into a runtime identifier, refusing anything it
+    /// cannot name.
+    /// </summary>
+    /// <param name="osMoniker">RID OS portion such as <c>win</c>, or null if unrecognised.</param>
+    /// <param name="architecture">Process/OS architecture to name.</param>
+    /// <remarks>
+    /// This used to answer <c>x64</c> for any unknown architecture and <c>win-{arch}</c> for any
+    /// unknown OS. Both are confidently wrong: the inferred RID selects the apphost template, so
+    /// a guess produces an executable for the wrong machine, or a template-not-found error naming
+    /// a platform the caller is not on. Failing closed makes the caller set
+    /// <see cref="BundleRequest.RuntimeIdentifier"/>, which is the only way to get it right.
+    /// </remarks>
+    internal static string BuildRuntimeIdentifier(string? osMoniker, Architecture architecture)
     {
-        var arch = RuntimeInformation.OSArchitecture switch
+        if (osMoniker is null)
+        {
+            throw new PEPackerException(
+                $"Cannot infer a runtime identifier: '{RuntimeInformation.OSDescription}' is not " +
+                "Windows, Linux or macOS. Set BundleRequest.RuntimeIdentifier explicitly.");
+        }
+
+        var arch = architecture switch
         {
             Architecture.X64 => "x64",
             Architecture.X86 => "x86",
             Architecture.Arm64 => "arm64",
             Architecture.Arm => "arm",
-            _ => "x64"
+            _ => throw new PEPackerException(
+                $"Cannot infer a runtime identifier: architecture '{architecture}' has no known " +
+                "RID suffix. Set BundleRequest.RuntimeIdentifier explicitly.")
         };
 
-        if (OperatingSystem.IsWindows()) return $"win-{arch}";
-        if (OperatingSystem.IsLinux()) return $"linux-{arch}";
-        if (OperatingSystem.IsMacOS()) return $"osx-{arch}";
+        return $"{osMoniker}-{arch}";
+    }
 
-        return $"win-{arch}";
+    /// <summary>
+    /// Moves a freshly written file onto the destination, honouring
+    /// <see cref="BundleRequest.Overwrite"/> at the moment of the move.
+    /// </summary>
+    /// <param name="source">The staged file, which is consumed.</param>
+    /// <param name="destination">Where it should end up.</param>
+    /// <param name="overwrite">Whether an existing destination may be replaced.</param>
+    /// <remarks>
+    /// The up-front <c>Overwrite</c> check happens before the bundle is built, so on its own it
+    /// only narrows the window: the previous delete-then-move replaced a file that appeared in
+    /// the meantime even when the caller had said not to. Letting the filesystem enforce it
+    /// closes that.
+    /// </remarks>
+    internal static void MoveIntoPlace(string source, string destination, bool overwrite)
+    {
+        if (overwrite)
+        {
+            File.Move(source, destination, overwrite: true);
+            return;
+        }
+
+        try
+        {
+            File.Move(source, destination);
+        }
+        catch (IOException ex) when (File.Exists(destination))
+        {
+            throw new PEPackerException(
+                $"'{destination}' already exists and BundleRequest.Overwrite is false.", ex);
+        }
     }
 
     /// <summary>

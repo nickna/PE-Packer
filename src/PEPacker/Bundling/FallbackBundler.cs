@@ -1,13 +1,13 @@
 namespace PEPacker.Bundling;
 
 /// <summary>
-/// A bundler that tries a primary bundler first, then falls back to a secondary bundler if the primary fails.
+/// A bundler that tries a primary bundler first, then falls back to a secondary bundler if the
+/// primary fails.
 /// </summary>
 public class FallbackBundler : IBundler
 {
     private readonly IBundler _primary;
     private readonly IBundler _fallback;
-    private BundleTechnique? _lastUsedTechnique;
 
     /// <summary>
     /// Creates a new fallback bundler.
@@ -16,21 +16,40 @@ public class FallbackBundler : IBundler
     /// <param name="fallback">The fallback bundler to use if primary fails.</param>
     public FallbackBundler(IBundler primary, IBundler fallback)
     {
+        ArgumentNullException.ThrowIfNull(primary);
+        ArgumentNullException.ThrowIfNull(fallback);
+
         _primary = primary;
         _fallback = fallback;
     }
 
-    /// <inheritdoc/>
-    public BundleTechnique Technique => _lastUsedTechnique ?? _primary.Technique;
+    /// <summary>
+    /// The primary bundler's technique — the one a bundle will be attempted with.
+    /// </summary>
+    /// <remarks>
+    /// It is deliberately not "whichever was used last". A single instance is shared (see
+    /// <see cref="BundlerFactory"/>) and may be used concurrently, so a last-used field made this
+    /// property report whichever unrelated call happened to finish most recently. The technique
+    /// a particular bundle actually used is on that bundle's
+    /// <see cref="BundleResult.Technique"/>, which cannot be raced.
+    /// </remarks>
+    public BundleTechnique Technique => _primary.Technique;
 
     /// <inheritdoc/>
     public BundleResult CreateSingleFileExecutable(BundleRequest request)
     {
+        ArgumentNullException.ThrowIfNull(request);
+
         try
         {
-            var result = _primary.CreateSingleFileExecutable(request);
-            _lastUsedTechnique = result.Technique;
-            return result;
+            return _primary.CreateSingleFileExecutable(request);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation is not a bundler failure. Retrying the fallback with an
+            // already-cancelled token could only cancel again, and reporting it as
+            // "both bundlers failed" hid the cancellation from the caller entirely.
+            throw;
         }
         catch (Exception primaryFailure)
         {
@@ -39,9 +58,11 @@ public class FallbackBundler : IBundler
             // macOS" are different problems and reporting only the second hides the first.
             try
             {
-                var result = _fallback.CreateSingleFileExecutable(request);
-                _lastUsedTechnique = result.Technique;
-                return result;
+                return _fallback.CreateSingleFileExecutable(request);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception fallbackFailure)
             {
@@ -52,13 +73,4 @@ public class FallbackBundler : IBundler
             }
         }
     }
-
-    /// <inheritdoc/>
-    public BundleResult CreateSingleFileExecutable(string dllPath, string exePath, string assemblyName) =>
-        CreateSingleFileExecutable(new BundleRequest
-        {
-            EntryAssemblyPath = dllPath,
-            OutputPath = exePath,
-            AssemblyName = assemblyName
-        });
 }

@@ -32,12 +32,12 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
     /// The assembly the rewriter retargets away from. It is an implementation assembly, so
     /// it is never a valid retarget destination and is skipped when indexing.
     /// </summary>
-    private const string CoreLib = "System.Private.CoreLib";
+    private const string CoreLib = WellKnownAssemblies.CoreLib;
 
     /// <summary>
     /// The core facade, which must resolve for the index to be usable at all.
     /// </summary>
-    private const string SystemRuntime = "System.Runtime";
+    private const string SystemRuntime = WellKnownAssemblies.SystemRuntime;
 
     private readonly Dictionary<string, string> _typeToAssembly = new(StringComparer.Ordinal);
     private readonly Dictionary<string, AssemblyIdentity> _identities = new(StringComparer.Ordinal);
@@ -177,8 +177,8 @@ public sealed class DirectoryReferenceAssemblyIndex : IReferenceAssemblyIndex
     /// <remarks>
     /// Captured alongside <see cref="TypeNames"/> so a serialised index answers
     /// <see cref="TryGetIdentity"/> the same way this one does. Deriving the identity set from the
-    /// types alone would drop the facades that own no publicly resolvable type — 36 of 167 in the
-    /// net10.0 reference pack — and quietly make the two implementations disagree.
+    /// types alone would drop the facades that own no publicly resolvable type — a substantial
+    /// minority of a reference pack — and quietly make the two implementations disagree.
     /// </remarks>
     public IEnumerable<string> AssemblyNames => _identities.Keys;
 
