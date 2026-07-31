@@ -2,6 +2,7 @@ using System.Reflection;
 using System.Reflection.Emit;
 using PEPacker.Tests.Infrastructure;
 using Xunit;
+using static PEPacker.Tests.Infrastructure.RewriterTestHelpers;
 
 namespace PEPacker.Tests;
 
@@ -55,15 +56,5 @@ public class ILVerifyHarnessTests
 
         using var harness = new ILVerifyHarness();
         Assert.Empty(harness.Verify(image));
-    }
-
-    private static byte[] Build(string name, Action<ModuleBuilder> emit)
-    {
-        var ab = new PersistedAssemblyBuilder(new AssemblyName(name), typeof(object).Assembly);
-        emit(ab.DefineDynamicModule(name));
-
-        using var stream = new MemoryStream();
-        ab.Save(stream);
-        return stream.ToArray();
     }
 }

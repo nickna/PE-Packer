@@ -1,9 +1,8 @@
-using System.Reflection;
 using System.Reflection.Metadata;
-using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using Xunit;
+using static PEPacker.Tests.Infrastructure.RewriterTestHelpers;
 
 namespace PEPacker.Tests;
 
@@ -52,11 +51,11 @@ public class ReferencePolicyTests
     public void DefaultPolicy_StillDropsALeakedSharpTSReference()
     {
         var source = AssemblyReferencing("SharpTS", referenceIsUsed: false);
-        Assert.Contains("SharpTS", AssemblyReferenceNamesOf(source));
+        Assert.Contains("SharpTS", RewriterFixtures.AssemblyReferenceNames(source));
 
         var rewritten = Rewrite(source, policy: null);
 
-        Assert.DoesNotContain("SharpTS", AssemblyReferenceNamesOf(rewritten));
+        Assert.DoesNotContain("SharpTS", RewriterFixtures.AssemblyReferenceNames(rewritten));
     }
 
     /// <summary>
@@ -83,7 +82,7 @@ public class ReferencePolicyTests
             AssemblyReferencing("SharpTS", referenceIsUsed: true),
             ReferencePolicy.RetargetCoreLibOnly);
 
-        Assert.Contains("SharpTS", AssemblyReferenceNamesOf(rewritten));
+        Assert.Contains("SharpTS", RewriterFixtures.AssemblyReferenceNames(rewritten));
 
         // The type reference must point at the copied row, not a nil scope.
         using var pe = new PEReader(new MemoryStream(rewritten));
@@ -118,88 +117,12 @@ public class ReferencePolicyTests
             referencePolicy: null!));
     }
 
-    private static byte[] Rewrite(byte[] source, Func<string, ReferenceAction>? policy)
-    {
-        using var rewriter = policy is null
-            ? new AssemblyReferenceRewriter(new MemoryStream(source), RuntimeEnvironment.GetRuntimeDirectory())
-            : new AssemblyReferenceRewriter(new MemoryStream(source), RuntimeEnvironment.GetRuntimeDirectory(), policy);
-
-        rewriter.Rewrite();
-        using var output = new MemoryStream();
-        rewriter.Save(output);
-        return output.ToArray();
-    }
-
-    private static List<string> AssemblyReferenceNamesOf(byte[] image)
-    {
-        using var pe = new PEReader(new MemoryStream(image));
-        var reader = pe.GetMetadataReader();
-        return reader.AssemblyReferences
-            .Select(h => reader.GetString(reader.GetAssemblyReference(h).Name))
-            .ToList();
-    }
-
     /// <summary>
     /// A minimal assembly with an <c>AssemblyRef</c> to <paramref name="assemblyName"/>,
-    /// optionally with a <c>TypeRef</c> scoped to it. Hand-built because
-    /// <c>PersistedAssemblyBuilder</c> cannot emit a reference to an assembly that is not
-    /// loadable.
+    /// optionally with a <c>TypeRef</c> scoped to it. Delegates to
+    /// <see cref="RewriterFixtures.Build"/>, which exists for exactly this shape.
     /// </summary>
-    /// <param name="assemblyName">Simple name of the referenced assembly.</param>
-    /// <param name="referenceIsUsed">
-    /// When <see langword="false"/>, the reference row exists but nothing resolves through
-    /// it — a "leaked" reference, which is the shape that can be dropped safely.
-    /// </param>
-    private static byte[] AssemblyReferencing(string assemblyName, bool referenceIsUsed)
-    {
-        var metadata = new MetadataBuilder();
-
-        metadata.AddAssembly(
-            metadata.GetOrAddString("Fixture"),
-            new Version(1, 0, 0, 0),
-            default,
-            default,
-            AssemblyFlags.PublicKey,
-            AssemblyHashAlgorithm.Sha1);
-
-        metadata.AddModule(
-            0,
-            metadata.GetOrAddString("Fixture.dll"),
-            metadata.GetOrAddGuid(Guid.NewGuid()),
-            default,
-            default);
-
-        var reference = metadata.AddAssemblyReference(
-            metadata.GetOrAddString(assemblyName),
-            new Version(1, 0, 0, 0),
-            default,
-            default,
-            default,
-            default);
-
-        if (referenceIsUsed)
-        {
-            metadata.AddTypeReference(
-                reference,
-                metadata.GetOrAddString("SharpTS.Runtime"),
-                metadata.GetOrAddString("TSObject"));
-        }
-
-        metadata.AddTypeDefinition(
-            default,
-            default,
-            metadata.GetOrAddString("<Module>"),
-            baseType: default,
-            fieldList: MetadataTokens.FieldDefinitionHandle(1),
-            methodList: MetadataTokens.MethodDefinitionHandle(1));
-
-        var peBuilder = new ManagedPEBuilder(
-            new PEHeaderBuilder(imageCharacteristics: Characteristics.Dll),
-            new MetadataRootBuilder(metadata),
-            new BlobBuilder());
-
-        var blob = new BlobBuilder();
-        peBuilder.Serialize(blob);
-        return blob.ToArray();
-    }
+    private static byte[] AssemblyReferencing(string assemblyName, bool referenceIsUsed) =>
+        RewriterFixtures.Build(assemblyName, new Version(1, 0, 0, 0),
+            "SharpTS.Runtime", "TSObject", addTypeReference: referenceIsUsed);
 }

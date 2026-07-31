@@ -100,7 +100,7 @@ internal static class Program
 
         try
         {
-            var fixture = EmitFixture("SmokeApp", out _);
+            var fixture = EmitFixture("SmokeApp");
             var index = new DirectoryReferenceAssemblyIndex(frameworkDirectory);
             Info("indexed", $"{index.TypeCount} types, {index.AssemblyCount} assemblies");
 
@@ -125,7 +125,7 @@ internal static class Program
     {
         try
         {
-            var fixture = EmitFixture("SmokeAppMem", out _);
+            var fixture = EmitFixture("SmokeAppMem");
             var rewritten = Rewrite(fixture, new InMemoryIndex());
             var references = AssemblyReferenceNames(rewritten);
 
@@ -150,7 +150,7 @@ internal static class Program
             Info("embedded", $"{index.TypeCount} types, {index.AssemblyCount} assemblies, "
                 + $"tfm {EmbeddedReferenceAssemblyIndex.EmbeddedTargetFramework}");
 
-            var fixture = EmitFixture("SmokeAppEmbedded", out _);
+            var fixture = EmitFixture("SmokeAppEmbedded");
             var rewritten = Rewrite(fixture, index);
             var references = AssemblyReferenceNames(rewritten);
 
@@ -173,7 +173,7 @@ internal static class Program
         // Single assembly, which is all the bundler could express before BundleRequest.
         try
         {
-            var app = EmitFixture("SoloApp", out _);
+            var app = EmitFixture("SoloApp");
             var exe = Path.Combine(_work, "solo", "SoloApp" + exeSuffix);
 
             var result = BundleWithDotNetRootHidden(new BundleRequest
@@ -198,7 +198,7 @@ internal static class Program
         try
         {
             var library = EmitLibrary("SmokeLib");
-            var app = EmitFixture("DuoApp", out _, loadAssemblyByName: "SmokeLib");
+            var app = EmitFixture("DuoApp", loadAssemblyByName: "SmokeLib");
             var exe = Path.Combine(_work, "duo", "DuoApp" + exeSuffix);
 
             BundleWithDotNetRootHidden(new BundleRequest
@@ -257,10 +257,15 @@ internal static class Program
             if (!Directory.Exists(shared)) continue;
 
             // Sort by parsed version, not by name: "9.0.17" sorts above "10.0.10" as a string,
-            // which silently indexed the older framework.
+            // which silently indexed the older framework. VersionUtil (reachable via
+            // InternalsVisibleTo) is the one shared parser for this recurring bug.
             var best = Directory.GetDirectories(shared)
                 .Where(d => File.Exists(Path.Combine(d, "System.Runtime.dll")))
-                .Select(d => (Dir: d, Version: ParseVersion(Path.GetFileName(d))))
+                .Select(d => (
+                    Dir: d,
+                    Version: VersionUtil.TryParse(Path.GetFileName(d), out var parsed)
+                        ? parsed
+                        : (VersionUtil.Parsed?)null))
                 .Where(x => x.Version is not null)
                 .OrderByDescending(x => x.Version)
                 .Select(x => x.Dir)
@@ -270,17 +275,6 @@ internal static class Program
         }
 
         return null;
-    }
-
-    /// <summary>
-    /// Parses a framework directory name, tolerating prerelease suffixes like
-    /// <c>10.0.0-preview.3</c>.
-    /// </summary>
-    private static Version? ParseVersion(string name)
-    {
-        var dash = name.IndexOf('-');
-        var trimmed = dash > 0 ? name[..dash] : name;
-        return Version.TryParse(trimmed, out var version) ? version : null;
     }
 
     private static IEnumerable<string> DotNetRoots()
@@ -331,7 +325,7 @@ internal static class Program
             "the Assembly.Load(byte[]) overloads. Neither is invoked here: the resolved " +
             "MethodInfo is only used as a metadata token in emitted IL, which executes in the " +
             "bundled child process on CoreCLR rather than in this AOT process.")]
-    private static string EmitFixture(string name, out MethodBuilder entryPoint, string? loadAssemblyByName = null)
+    private static string EmitFixture(string name, string? loadAssemblyByName = null)
     {
         var path = Path.Combine(_work, $"{name}.dll");
 
@@ -379,7 +373,6 @@ internal static class Program
         il.Emit(OpCodes.Ret);
 
         type.CreateType();
-        entryPoint = main;
 
         var metadata = ab.GenerateMetadata(out var ilStream, out var fieldData);
         var peBuilder = new ManagedPEBuilder(
@@ -427,10 +420,23 @@ internal static class Program
         };
 
         using var process = Process.Start(psi)!;
-        var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = process.StandardError.ReadToEnd();
-        process.WaitForExit(120_000);
-        return (process.ExitCode, stdout, stderr);
+
+        // Both streams are drained concurrently: reading stdout to end before touching
+        // stderr deadlocks once the child fills the untouched pipe's buffer.
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+
+        if (!process.WaitForExit(120_000))
+        {
+            // The old code discarded this bool, so a hung child surfaced later as an
+            // InvalidOperationException from ExitCode. The throw lands in the caller's
+            // catch block and is reported as a named failure.
+            try { process.Kill(entireProcessTree: true); } catch { /* already exited */ }
+            throw new TimeoutException(
+                $"'{exePath}' did not exit within 120 seconds and was killed.");
+        }
+
+        return (process.ExitCode, stdout.GetAwaiter().GetResult(), stderr.GetAwaiter().GetResult());
     }
 
     private static string First(string text)

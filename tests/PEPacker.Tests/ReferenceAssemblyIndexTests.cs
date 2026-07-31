@@ -1,11 +1,8 @@
-using System.Collections.Immutable;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
-using System.Reflection.Metadata;
-using System.Reflection.Metadata.Ecma335;
-using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using Xunit;
+using static PEPacker.Tests.Infrastructure.RewriterTestHelpers;
 
 namespace PEPacker.Tests;
 
@@ -30,8 +27,8 @@ public class ReferenceAssemblyIndexTests
             .WithType("System.Object", "System.Runtime")
             .WithType("System.Collections.Generic.List`1", "System.Collections");
 
-        var rewritten = Rewrite(CoreLibReferencingAssembly(), index);
-        var references = AssemblyReferenceNamesOf(rewritten);
+        var rewritten = Rewrite(RewriterFixtures.CoreLibReferencingAssembly(), index);
+        var references = RewriterFixtures.AssemblyReferenceNames(rewritten);
 
         Assert.DoesNotContain("System.Private.CoreLib", references);
         Assert.Contains("System.Runtime", references);
@@ -50,10 +47,10 @@ public class ReferenceAssemblyIndexTests
             .WithType("System.Collections.Generic.List`1", "System.Collections");
 
         var rewritten = Rewrite(
-            CoreLibReferencingAssembly("System.Collections.Generic", "List`1"),
+            RewriterFixtures.CoreLibReferencingAssembly("System.Collections.Generic", "List`1"),
             index);
 
-        Assert.Contains("System.Collections", AssemblyReferenceNamesOf(rewritten));
+        Assert.Contains("System.Collections", RewriterFixtures.AssemblyReferenceNames(rewritten));
     }
 
     /// <summary>
@@ -64,16 +61,17 @@ public class ReferenceAssemblyIndexTests
     {
         var index = new FakeIndex().WithAssembly("System.Runtime");
 
-        var rewritten = Rewrite(CoreLibReferencingAssembly("Contoso.Unknown", "Widget"), index);
+        var rewritten = Rewrite(
+            RewriterFixtures.CoreLibReferencingAssembly("Contoso.Unknown", "Widget"), index);
 
-        Assert.Contains("System.Runtime", AssemblyReferenceNamesOf(rewritten));
+        Assert.Contains("System.Runtime", RewriterFixtures.AssemblyReferenceNames(rewritten));
     }
 
     [Fact]
     public void Ctor_NullIndex_Throws()
     {
         Assert.Throws<ArgumentNullException>(() => new AssemblyReferenceRewriter(
-            new MemoryStream(CoreLibReferencingAssembly()), referenceIndex: null!));
+            new MemoryStream(RewriterFixtures.CoreLibReferencingAssembly()), referenceIndex: null!));
     }
 
     /// <summary>
@@ -212,78 +210,6 @@ public class ReferenceAssemblyIndexTests
         var ex = Assert.Throws<PEPackerException>(() => new DirectoryReferenceAssemblyIndex(missing));
 
         Assert.Contains(missing, ex.Message);
-    }
-
-    private static byte[] Rewrite(byte[] source, IReferenceAssemblyIndex index)
-    {
-        using var rewriter = new AssemblyReferenceRewriter(new MemoryStream(source), index);
-        rewriter.Rewrite();
-        using var output = new MemoryStream();
-        rewriter.Save(output);
-        return output.ToArray();
-    }
-
-    private static List<string> AssemblyReferenceNamesOf(byte[] image)
-    {
-        using var pe = new PEReader(new MemoryStream(image));
-        var reader = pe.GetMetadataReader();
-        return reader.AssemblyReferences
-            .Select(h => reader.GetString(reader.GetAssemblyReference(h).Name))
-            .ToList();
-    }
-
-    /// <summary>
-    /// A minimal assembly whose single type reference is scoped to
-    /// <c>System.Private.CoreLib</c> — the shape the rewriter exists to retarget.
-    /// </summary>
-    private static byte[] CoreLibReferencingAssembly(string ns = "System", string typeName = "Object")
-    {
-        var metadata = new MetadataBuilder();
-
-        metadata.AddAssembly(
-            metadata.GetOrAddString("Fixture"),
-            new Version(1, 0, 0, 0),
-            default,
-            default,
-            AssemblyFlags.PublicKey,
-            AssemblyHashAlgorithm.Sha1);
-
-        metadata.AddModule(
-            0,
-            metadata.GetOrAddString("Fixture.dll"),
-            metadata.GetOrAddGuid(Guid.NewGuid()),
-            default,
-            default);
-
-        var coreLib = metadata.AddAssemblyReference(
-            metadata.GetOrAddString("System.Private.CoreLib"),
-            new Version(10, 0, 0, 0),
-            default,
-            default,
-            default,
-            default);
-
-        metadata.AddTypeReference(
-            coreLib,
-            metadata.GetOrAddString(ns),
-            metadata.GetOrAddString(typeName));
-
-        metadata.AddTypeDefinition(
-            default,
-            default,
-            metadata.GetOrAddString("<Module>"),
-            baseType: default,
-            fieldList: MetadataTokens.FieldDefinitionHandle(1),
-            methodList: MetadataTokens.MethodDefinitionHandle(1));
-
-        var peBuilder = new ManagedPEBuilder(
-            new PEHeaderBuilder(imageCharacteristics: Characteristics.Dll),
-            new MetadataRootBuilder(metadata),
-            new BlobBuilder());
-
-        var blob = new BlobBuilder();
-        peBuilder.Serialize(blob);
-        return blob.ToArray();
     }
 
     /// <summary>

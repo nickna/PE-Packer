@@ -263,25 +263,19 @@ public class EmbeddedReferenceAssemblyIndexTests
 
         // Ordered by parsed version, not by name: "10.0.9" sorts above "10.0.10" as a string, which
         // silently compared the embedded data against a different patch of the reference pack than
-        // it was generated from.
+        // it was generated from. VersionUtil is the one shared parser for this recurring bug.
         return Directory.GetDirectories(packs)
             .Where(d => Path.GetFileName(d).StartsWith(wanted + ".", StringComparison.Ordinal))
-            .Select(d => (Dir: Path.Combine(d, "ref", tfm), Version: ParseVersion(Path.GetFileName(d))))
+            .Select(d => (
+                Dir: Path.Combine(d, "ref", tfm),
+                Version: VersionUtil.TryParse(Path.GetFileName(d), out var parsed)
+                    ? parsed
+                    : (VersionUtil.Parsed?)null))
             .Where(x => x.Version is not null
                 && Directory.Exists(x.Dir)
                 && File.Exists(Path.Combine(x.Dir, "System.Runtime.dll")))
             .OrderByDescending(x => x.Version)
             .Select(x => x.Dir)
             .FirstOrDefault();
-    }
-
-    /// <summary>
-    /// Parses a pack directory name, tolerating prerelease suffixes.
-    /// </summary>
-    private static Version? ParseVersion(string name)
-    {
-        var dash = name.IndexOf('-');
-        var trimmed = dash > 0 ? name[..dash] : name;
-        return Version.TryParse(trimmed, out var version) ? version : null;
     }
 }

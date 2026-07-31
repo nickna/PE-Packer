@@ -23,6 +23,15 @@ namespace PEPacker.Tests.Infrastructure;
 /// <c>System.Private.CoreLib</c> becoming <c>System.Runtime</c> is the point of the
 /// exercise — and is checked separately by <see cref="CompareRetargeting"/>.
 /// </para>
+/// <para>
+/// What is compared: the assembly's own definition row (which the rewrite must copy
+/// verbatim); table row counts; every type with its fields (including marshalling, layout
+/// and the actual mapped FieldRVA bytes), methods, properties and events; every custom
+/// attribute's parent, constructor and verbatim value blob (the rewriter copies CA blobs
+/// byte-for-byte); and every method body — header, exception regions, token operands
+/// resolved to names, and all remaining IL bytes (opcodes, branch targets, inline
+/// constants, switch tables) byte-for-byte with only the token operand sites masked.
+/// </para>
 /// </remarks>
 internal static class MetadataDiffer
 {
@@ -35,13 +44,36 @@ internal static class MetadataDiffer
         var a = beforePe.GetMetadataReader();
         var b = afterPe.GetMetadataReader();
 
+        CompareAssemblyDefinition(a, b, differences);
         CompareTableCounts(a, b, differences);
         CompareRetargeting(b, differences);
         CompareTypes(a, b, differences);
+        CompareCustomAttributes(a, b, differences);
+        CompareFieldRvaData(beforePe, a, afterPe, b, differences);
         CompareMethodBodies(beforePe, a, afterPe, b, differences);
         ComparePEHeaders(beforePe, afterPe, differences);
 
         return differences;
+    }
+
+    /// <summary>
+    /// The output's own Assembly row must be a verbatim copy: the rewrite retargets
+    /// references, never the assembly's own identity.
+    /// </summary>
+    private static void CompareAssemblyDefinition(MetadataReader a, MetadataReader b, List<string> differences)
+    {
+        if (!Check(differences, "Assembly", "row present", a.IsAssembly, b.IsAssembly)) return;
+        if (!a.IsAssembly) return;
+
+        var da = a.GetAssemblyDefinition();
+        var db = b.GetAssemblyDefinition();
+
+        Check(differences, "Assembly", "name", a.GetString(da.Name), b.GetString(db.Name));
+        Check(differences, "Assembly", "version", da.Version, db.Version);
+        Check(differences, "Assembly", "culture", a.GetString(da.Culture), b.GetString(db.Culture));
+        Check(differences, "Assembly", "flags", da.Flags, db.Flags);
+        Check(differences, "Assembly", "hash algorithm", da.HashAlgorithm, db.HashAlgorithm);
+        Check(differences, "Assembly", "public key", DescribeBlob(a, da.PublicKey), DescribeBlob(b, db.PublicKey));
     }
 
     /// <summary>
@@ -149,14 +181,66 @@ internal static class MetadataDiffer
             Check(differences, name, "field name", a.GetString(fa.Name), b.GetString(fb.Name));
             Check(differences, name, "field attributes", fa.Attributes, fb.Attributes);
             Check(differences, name, "field signature",
-                fa.DecodeSignature(new SignatureStringProvider(a), null),
-                fb.DecodeSignature(new SignatureStringProvider(b), null));
+                fa.DecodeSignature(SignatureStringProvider.Instance, null),
+                fb.DecodeSignature(SignatureStringProvider.Instance, null));
             Check(differences, name, "field constant", DescribeConstant(a, fa.GetDefaultValue()), DescribeConstant(b, fb.GetDefaultValue()));
             Check(differences, name, "field offset", fa.GetOffset(), fb.GetOffset());
             Check(differences, name, "field marshalling",
                 DescribeBlob(a, fa.GetMarshallingDescriptor()), DescribeBlob(b, fb.GetMarshallingDescriptor()));
-            Check(differences, name, "field has RVA",
-                fa.GetRelativeVirtualAddress() != 0, fb.GetRelativeVirtualAddress() != 0);
+            // RVA presence and the mapped data bytes are compared by CompareFieldRvaData,
+            // which has the PEReaders needed to actually read the section contents.
+        }
+    }
+
+    /// <summary>
+    /// Compares each RVA-carrying field's mapped data bytes, not just their presence. A
+    /// FieldRVA row pointing at zeroed or truncated data used to pass the old
+    /// "has RVA" check while every static initializer quietly changed value.
+    /// </summary>
+    private static void CompareFieldRvaData(PEReader peA, MetadataReader a,
+        PEReader peB, MetadataReader b, List<string> differences)
+    {
+        var fieldsA = a.FieldDefinitions.ToList();
+        var fieldsB = b.FieldDefinitions.ToList();
+        if (fieldsA.Count != fieldsB.Count) return; // already reported by the count pass
+
+        for (int i = 0; i < fieldsA.Count; i++)
+        {
+            var fa = a.GetFieldDefinition(fieldsA[i]);
+            var fb = b.GetFieldDefinition(fieldsB[i]);
+            var name = $"{FullName(a, a.GetTypeDefinition(fa.GetDeclaringType()))}.{a.GetString(fa.Name)}";
+
+            int rvaA = fa.GetRelativeVirtualAddress();
+            int rvaB = fb.GetRelativeVirtualAddress();
+            if (!Check(differences, name, "field has RVA", rvaA != 0, rvaB != 0)) continue;
+            if (rvaA == 0) continue;
+
+            int sizeA = FieldDataSize(peA, a, fa);
+            int sizeB = FieldDataSize(peB, b, fb);
+            if (!Check(differences, name, "field RVA data size", sizeA, sizeB)) continue;
+            if (sizeA <= 0) continue; // unsizable from the signature; presence was checked
+
+            Check(differences, name, "field RVA data",
+                Convert.ToHexString(peA.GetSectionData(rvaA).GetContent(0, sizeA).AsSpan()),
+                Convert.ToHexString(peB.GetSectionData(rvaB).GetContent(0, sizeB).AsSpan()));
+        }
+    }
+
+    /// <summary>
+    /// Sizes a field's RVA data from its signature, or -1 when the signature cannot be
+    /// sized (a shape none of the fixtures produce; presence is still compared).
+    /// </summary>
+    private static int FieldDataSize(PEReader pe, MetadataReader reader, FieldDefinition field)
+    {
+        try
+        {
+            int pointerSize = pe.PEHeaders.PEHeader is { Magic: PEMagic.PE32 } ? 4 : 8;
+            int size = field.DecodeSignature(new FieldDataSizeProvider(pointerSize), null);
+            return size > 0 ? size : -1;
+        }
+        catch
+        {
+            return -1;
         }
     }
 
@@ -241,9 +325,39 @@ internal static class MetadataDiffer
     }
 
     /// <summary>
-    /// Compares each method body instruction by instruction, resolving token operands to
-    /// names so a shifted heap or a renumbered table shows up as a changed operand rather
-    /// than passing because the raw bytes happened to match.
+    /// Row-by-row CustomAttribute comparison. The old count-only check let a swapped
+    /// parent, a wrong constructor or a corrupted argument blob pass unremarked.
+    /// </summary>
+    /// <remarks>
+    /// The rewriter copies CA value blobs verbatim (<c>CopyCustomAttributes</c> passes the
+    /// source bytes straight to <c>GetOrAddBlob</c>), so the blob comparison is verbatim
+    /// too. Parents and constructors are compared by resolved name, since their handles
+    /// legitimately move.
+    /// </remarks>
+    private static void CompareCustomAttributes(MetadataReader a, MetadataReader b, List<string> differences)
+    {
+        var attrsA = a.CustomAttributes.ToList();
+        var attrsB = b.CustomAttributes.ToList();
+        if (attrsA.Count != attrsB.Count) return; // already reported by the count pass
+
+        for (int i = 0; i < attrsA.Count; i++)
+        {
+            var ca = a.GetCustomAttribute(attrsA[i]);
+            var cb = b.GetCustomAttribute(attrsB[i]);
+            var name = $"CustomAttribute #{i + 1}";
+
+            Check(differences, name, "parent", Describe(a, ca.Parent), Describe(b, cb.Parent));
+            Check(differences, name, "constructor", Describe(a, ca.Constructor), Describe(b, cb.Constructor));
+            Check(differences, name, "value blob", DescribeBlob(a, ca.Value), DescribeBlob(b, cb.Value));
+        }
+    }
+
+    /// <summary>
+    /// Compares each method body: header fields, exception regions, token operands
+    /// resolved to names (so a shifted heap or renumbered table shows up as a changed
+    /// operand), and every remaining IL byte verbatim with only the token operand sites
+    /// masked — so a same-length corruption of a branch target, an inline constant or a
+    /// switch table cannot pass.
     /// </summary>
     private static void CompareMethodBodies(PEReader peA, MetadataReader a,
         PEReader peB, MetadataReader b, List<string> differences)
@@ -277,13 +391,30 @@ internal static class MetadataDiffer
             Check(differences, name, "IL length", ilA.Length, ilB.Length);
             if (ilA.Length != ilB.Length) continue;
 
+            // Token operands are compared semantically: their row numbers legitimately
+            // change, so the four operand bytes are masked out of the verbatim pass below.
+            var tokenOperandBytes = new bool[ilA.Length];
             foreach (var (offset, token) in ILTokenSites(ilA))
             {
+                for (int j = 0; j < 4; j++) tokenOperandBytes[offset + j] = true;
+
                 var describedA = DescribeToken(a, token);
                 var describedB = DescribeToken(b, BitConverter.ToInt32(ilB, offset));
                 if (describedA != describedB)
                 {
                     differences.Add($"{name}: IL operand at 0x{offset - 1:X4} was {describedA}, now {describedB}");
+                }
+            }
+
+            // Everything that is not a token operand — opcodes, branch targets, inline
+            // constants, switch tables — must be byte-identical.
+            for (int j = 0; j < ilA.Length; j++)
+            {
+                if (!tokenOperandBytes[j] && ilA[j] != ilB[j])
+                {
+                    differences.Add(
+                        $"{name}: IL byte at 0x{j:X4} was 0x{ilA[j]:X2}, now 0x{ilB[j]:X2}");
+                    break; // one finding per body is enough to fail the diff
                 }
             }
         }
@@ -349,7 +480,7 @@ internal static class MetadataDiffer
 
             case HandleKind.TypeSpecification:
                 return reader.GetTypeSpecification((TypeSpecificationHandle)handle)
-                    .DecodeSignature(new SignatureStringProvider(reader), null);
+                    .DecodeSignature(SignatureStringProvider.Instance, null);
 
             case HandleKind.MethodDefinition:
             {
@@ -373,7 +504,7 @@ internal static class MetadataDiffer
             case HandleKind.MethodSpecification:
             {
                 var spec = reader.GetMethodSpecification((MethodSpecificationHandle)handle);
-                var args = spec.DecodeSignature(new SignatureStringProvider(reader), null);
+                var args = spec.DecodeSignature(SignatureStringProvider.Instance, null);
                 return $"{Describe(reader, spec.Method)}<{string.Join(",", args)}>";
             }
 
@@ -382,6 +513,38 @@ internal static class MetadataDiffer
 
             case HandleKind.StandaloneSignature:
                 return DescribeStandaloneSignature(reader, (StandaloneSignatureHandle)handle);
+
+            // The kinds below matter as custom-attribute parents: without them two
+            // attributes on different rows of the same kind compared as equal.
+            case HandleKind.Parameter:
+            {
+                var parameter = reader.GetParameter((ParameterHandle)handle);
+                return $"param #{parameter.SequenceNumber} {reader.GetString(parameter.Name)}";
+            }
+
+            case HandleKind.GenericParameter:
+            {
+                var parameter = reader.GetGenericParameter((GenericParameterHandle)handle);
+                return $"genericparam {parameter.Index}:{reader.GetString(parameter.Name)}";
+            }
+
+            case HandleKind.GenericParameterConstraint:
+            {
+                var constraint = reader.GetGenericParameterConstraint((GenericParameterConstraintHandle)handle);
+                return $"constraint {Describe(reader, constraint.Type)}";
+            }
+
+            case HandleKind.AssemblyDefinition:
+                return $"assembly {reader.GetString(reader.GetAssemblyDefinition().Name)}";
+
+            case HandleKind.ModuleDefinition:
+                return $"module {reader.GetString(reader.GetModuleDefinition().Name)}";
+
+            case HandleKind.PropertyDefinition:
+                return $"property {reader.GetString(reader.GetPropertyDefinition((PropertyDefinitionHandle)handle).Name)}";
+
+            case HandleKind.EventDefinition:
+                return $"event {reader.GetString(reader.GetEventDefinition((EventDefinitionHandle)handle).Name)}";
 
             default:
                 return handle.Kind.ToString();
@@ -413,7 +576,7 @@ internal static class MetadataDiffer
         var blob = reader.GetBlobReader(signature.Signature);
         if (blob.Length == 0) return "<empty>";
 
-        var provider = new SignatureStringProvider(reader);
+        var provider = SignatureStringProvider.Instance;
         try
         {
             return blob.ReadByte() == 0x07
@@ -427,10 +590,10 @@ internal static class MetadataDiffer
     }
 
     private static string DescribeMethodSignature(MetadataReader reader, MethodDefinition method) =>
-        Render(method.DecodeSignature(new SignatureStringProvider(reader), null));
+        Render(method.DecodeSignature(SignatureStringProvider.Instance, null));
 
     private static string DescribePropertySignature(MetadataReader reader, PropertyDefinition property) =>
-        Render(property.DecodeSignature(new SignatureStringProvider(reader), null));
+        Render(property.DecodeSignature(SignatureStringProvider.Instance, null));
 
     private static string Render(MethodSignature<string> signature) =>
         $"{signature.ReturnType}({string.Join(",", signature.ParameterTypes)}) " +
@@ -591,5 +754,51 @@ internal static class MetadataDiffer
 
         differences.Add($"{subject}: {aspect} was '{before}', now '{after}'");
         return false;
+    }
+
+    /// <summary>
+    /// Sizes a field type for FieldRVA data comparison: primitives by width, value types
+    /// defined in the module by their ClassLayout size (the shape
+    /// <c>DefineInitializedData</c> produces), pointers by the image's pointer width.
+    /// Anything else returns 0, which the caller treats as "unsizable".
+    /// </summary>
+    /// <remarks>
+    /// Deliberately independent of the rewriter's internal size provider, for the same
+    /// reason <see cref="ILTokenSites"/> does not reuse the rewriter's opcode table: a
+    /// checker sharing the code under test inherits its bugs.
+    /// </remarks>
+    private sealed class FieldDataSizeProvider : ISignatureTypeProvider<int, object?>
+    {
+        private readonly int _pointerSize;
+
+        public FieldDataSizeProvider(int pointerSize) => _pointerSize = pointerSize;
+
+        public int GetPrimitiveType(PrimitiveTypeCode typeCode) => typeCode switch
+        {
+            PrimitiveTypeCode.Boolean or PrimitiveTypeCode.Byte or PrimitiveTypeCode.SByte => 1,
+            PrimitiveTypeCode.Char or PrimitiveTypeCode.Int16 or PrimitiveTypeCode.UInt16 => 2,
+            PrimitiveTypeCode.Int32 or PrimitiveTypeCode.UInt32 or PrimitiveTypeCode.Single => 4,
+            PrimitiveTypeCode.Int64 or PrimitiveTypeCode.UInt64 or PrimitiveTypeCode.Double => 8,
+            PrimitiveTypeCode.IntPtr or PrimitiveTypeCode.UIntPtr => _pointerSize,
+            _ => 0,
+        };
+
+        public int GetTypeFromDefinition(MetadataReader reader, TypeDefinitionHandle handle, byte rawTypeKind) =>
+            reader.GetTypeDefinition(handle).GetLayout().Size;
+
+        public int GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind) => 0;
+        public int GetTypeFromSpecification(MetadataReader reader, object? genericContext,
+            TypeSpecificationHandle handle, byte rawTypeKind) => 0;
+        public int GetSZArrayType(int elementType) => 0;
+        public int GetArrayType(int elementType, ArrayShape shape) => 0;
+        public int GetByReferenceType(int elementType) => 0;
+        public int GetPointerType(int elementType) => _pointerSize;
+        public int GetFunctionPointerType(MethodSignature<int> signature) => _pointerSize;
+        public int GetGenericInstantiation(int genericType, System.Collections.Immutable.ImmutableArray<int> typeArguments) => 0;
+        public int GetGenericMethodParameter(object? genericContext, int index) => 0;
+        public int GetGenericTypeParameter(object? genericContext, int index) => 0;
+        public int GetModifiedType(int modifier, int unmodifiedType, bool isRequired) => unmodifiedType;
+        public int GetPinnedType(int elementType) => elementType;
+        public int GetTypeFromSerializedName(string name) => 0;
     }
 }

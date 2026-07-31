@@ -316,11 +316,19 @@ public class BundleRequestTests : IDisposable
             return null;
         }
 
+        // Ordered by parsed version, not by name: "9.0.17" sorts above "10.0.10" as a
+        // string, which silently picked an old host pack. (This exact bug has now been
+        // fixed four times in this repository — hence VersionUtil.)
         var name = OperatingSystem.IsWindows() ? "apphost.exe" : "apphost";
         return Directory.GetDirectories(packageDir)
-            .Select(v => Path.Combine(v, "runtimes", rid, "native", name))
-            .Where(File.Exists)
-            .OrderByDescending(p => p, StringComparer.Ordinal)
+            .Select(v => (
+                Path: Path.Combine(v, "runtimes", rid, "native", name),
+                Version: VersionUtil.TryParse(Path.GetFileName(v), out var parsed)
+                    ? parsed
+                    : (VersionUtil.Parsed?)null))
+            .Where(x => x.Version is not null && File.Exists(x.Path))
+            .OrderByDescending(x => x.Version)
+            .Select(x => x.Path)
             .FirstOrDefault();
     }
 
@@ -334,11 +342,28 @@ public class BundleRequestTests : IDisposable
         };
 
         using var process = Process.Start(psi)!;
-        var stdout = process.StandardOutput.ReadToEnd();
-        var stderr = process.StandardError.ReadToEnd();
-        process.WaitForExit(60_000);
-        return (process.ExitCode, stdout, stderr);
+
+        // Both streams are drained concurrently: reading stdout to end before touching
+        // stderr deadlocks once the child fills the untouched pipe's buffer.
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+
+        if (!process.WaitForExit(60_000))
+        {
+            // The old code discarded this bool, so a hung child surfaced later as an
+            // InvalidOperationException from ExitCode with no hint of what happened.
+            try { process.Kill(entireProcessTree: true); } catch { /* already exited */ }
+            throw new TimeoutException(
+                $"'{exePath}' did not exit within 60 seconds and was killed. " +
+                $"Partial stdout=[{SafeResult(stdout)}] stderr=[{SafeResult(stderr)}]");
+        }
+
+        return (process.ExitCode, stdout.GetAwaiter().GetResult(), stderr.GetAwaiter().GetResult());
     }
+
+    /// <summary>Best-effort read of a possibly still-unfinished stream task.</summary>
+    private static string SafeResult(Task<string> task) =>
+        task.Wait(TimeSpan.FromSeconds(5)) ? task.Result.Trim() : "<unavailable>";
 
     /// <summary>
     /// Emits a library exposing <c>Greeter.Message()</c>.
