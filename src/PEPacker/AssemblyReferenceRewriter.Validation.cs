@@ -54,8 +54,6 @@ public partial class AssemblyReferenceRewriter
     private static string DescribeTable(TableIndex table) => table switch
     {
         TableIndex.DeclSecurity => "declarative security attributes",
-        TableIndex.ModuleRef => "module references",
-        TableIndex.ImplMap => "P/Invoke method definitions",
         TableIndex.File => "multi-file assembly manifests",
         TableIndex.ExportedType => "exported or forwarded types",
         TableIndex.ManifestResource => "embedded or linked managed resources",

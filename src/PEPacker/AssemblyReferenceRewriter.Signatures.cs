@@ -332,12 +332,12 @@ public partial class AssemblyReferenceRewriter
 
         if (header != LocalVarSigCallingConvention)
         {
-            // Not a local variables signature
-            while (reader.RemainingBytes > 0)
-            {
-                builder.WriteByte(reader.ReadByte());
-            }
-            return builder.ToArray();
+            // The only caller peeks the header and routes non-LOCAL_SIG blobs to
+            // RewriteMethodSignature, so this is unreachable — and a verbatim copy here
+            // would carry any embedded type tokens over unmapped.
+            throw new PEPackerException(
+                $"RewriteLocalVarsSignature was handed a blob with calling convention " +
+                $"0x{header:X2}, not LOCAL_SIG (0x{LocalVarSigCallingConvention:X2}).");
         }
 
         // Local count

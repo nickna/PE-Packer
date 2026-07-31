@@ -80,6 +80,14 @@ public partial class AssemblyReferenceRewriter
                 if (_genericParamMap.TryGetValue((GenericParameterHandle)handle, out var genericParam)) return genericParam;
                 break;
 
+            case HandleKind.GenericParameterConstraint:
+                if (_genericParamConstraintMap.TryGetValue((GenericParameterConstraintHandle)handle, out var genericParamConstraint)) return genericParamConstraint;
+                break;
+
+            case HandleKind.StandaloneSignature:
+                if (_standAloneSigMap.TryGetValue((StandaloneSignatureHandle)handle, out var standaloneSig)) return standaloneSig;
+                break;
+
             // Single-row tables, and tables emitted strictly in source order, so their
             // row numbers are unchanged by construction.
             case HandleKind.AssemblyDefinition:
@@ -117,13 +125,24 @@ public partial class AssemblyReferenceRewriter
     #endregion
 
     /// <summary>
+    /// The source image's pointer width: 4 for PE32, 8 for PE32+ (ECMA-335 II.25.2.3.1).
+    /// </summary>
+    private int SourcePointerSize =>
+        _peReader.PEHeaders.PEHeader is { Magic: System.Reflection.PortableExecutable.PEMagic.PE32 } ? 4 : 8;
+
+    /// <summary>
     /// Helper to get field data size from signature.
     /// </summary>
+    /// <remarks>
+    /// Pointer-sized types take the width from the source PE header rather than a
+    /// hardcoded 8: on a 32-bit image an assumed 8-byte pointer over-read adjacent
+    /// section data into the copied FieldRVA blob.
+    /// </remarks>
     private class FieldDataSizeProvider : ISignatureTypeProvider<int, object?>
     {
-        private readonly MetadataReader _reader;
+        private readonly int _pointerSize;
 
-        public FieldDataSizeProvider(MetadataReader reader) => _reader = reader;
+        public FieldDataSizeProvider(int pointerSize) => _pointerSize = pointerSize;
 
         public int GetPrimitiveType(PrimitiveTypeCode typeCode) => typeCode switch
         {
@@ -139,8 +158,8 @@ public partial class AssemblyReferenceRewriter
             PrimitiveTypeCode.UInt64 => 8,
             PrimitiveTypeCode.Single => 4,
             PrimitiveTypeCode.Double => 8,
-            PrimitiveTypeCode.IntPtr => 8,
-            PrimitiveTypeCode.UIntPtr => 8,
+            PrimitiveTypeCode.IntPtr => _pointerSize,
+            PrimitiveTypeCode.UIntPtr => _pointerSize,
             _ => 0
         };
 
@@ -156,11 +175,11 @@ public partial class AssemblyReferenceRewriter
         public int GetTypeFromReference(MetadataReader reader, TypeReferenceHandle handle, byte rawTypeKind) => 0;
         public int GetTypeFromSpecification(MetadataReader reader, object? genericContext, TypeSpecificationHandle handle, byte rawTypeKind) => 0;
         public int GetSZArrayType(int elementType) => 0;
-        public int GetPointerType(int elementType) => 8;
-        public int GetByReferenceType(int elementType) => 8;
+        public int GetPointerType(int elementType) => _pointerSize;
+        public int GetByReferenceType(int elementType) => _pointerSize;
         public int GetGenericInstantiation(int genericType, ImmutableArray<int> typeArguments) => 0;
         public int GetArrayType(int elementType, ArrayShape shape) => 0;
-        public int GetFunctionPointerType(MethodSignature<int> signature) => 8;
+        public int GetFunctionPointerType(MethodSignature<int> signature) => _pointerSize;
         public int GetGenericMethodParameter(object? genericContext, int index) => 0;
         public int GetGenericTypeParameter(object? genericContext, int index) => 0;
         public int GetModifiedType(int modifier, int unmodifiedType, bool isRequired) => unmodifiedType;

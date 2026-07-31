@@ -183,7 +183,7 @@ public partial class AssemblyReferenceRewriter
         int size;
         try
         {
-            size = field.DecodeSignature(new FieldDataSizeProvider(_reader), null);
+            size = field.DecodeSignature(new FieldDataSizeProvider(SourcePointerSize), null);
         }
         catch (Exception ex)
         {
@@ -252,12 +252,6 @@ public partial class AssemblyReferenceRewriter
                 newModule);
         }
 
-        // Track entry point
-        if (methodHandle == _sourceEntryPoint)
-        {
-            _targetEntryPoint = newHandle;
-        }
-
         // Copy parameters (including any return-value Param row at sequence 0),
         // advancing the run-pointer counter for each row emitted.
         foreach (var paramHandle in method.GetParameters())
@@ -319,11 +313,14 @@ public partial class AssemblyReferenceRewriter
             _genericParamMap[entry.Source] = newHandle;
 
             // GenericParamConstraint is sorted by Owner too. Adding each parameter's
-            // constraints immediately keeps those owners ascending.
+            // constraints immediately keeps those owners ascending. The mapping is
+            // recorded because a constraint can parent a custom attribute (Roslyn emits
+            // NullableAttribute there), which CopyCustomAttributes must remap.
             foreach (var constraintHandle in genParam.GetConstraints())
             {
                 var constraint = _reader.GetGenericParameterConstraint(constraintHandle);
-                _metadata.AddGenericParameterConstraint(newHandle, MapEntityHandle(constraint.Type));
+                _genericParamConstraintMap[constraintHandle] =
+                    _metadata.AddGenericParameterConstraint(newHandle, MapEntityHandle(constraint.Type));
             }
         }
     }

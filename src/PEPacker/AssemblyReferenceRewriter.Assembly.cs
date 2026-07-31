@@ -72,10 +72,12 @@ public partial class AssemblyReferenceRewriter
                 {
                     var typeName = GetFullTypeName(typeRef);
 
-                    // Default to System.Runtime for types the index does not know.
+                    // Default to the core facade for types the index does not know. This
+                    // is deliberate for the CoreLib-retarget path: an unindexed type is
+                    // assumed to live in System.Runtime rather than rejected outright.
                     neededAssemblies.Add(_referenceIndex.TryResolveType(typeName, out var owner)
                         ? owner.Name
-                        : "System.Runtime");
+                        : CoreFacadeAssemblyName);
                 }
             }
         }
@@ -84,24 +86,33 @@ public partial class AssemblyReferenceRewriter
         // index sees files in different orders on Windows (alphabetical) and Linux (inode
         // order), which changes which assembly wins for a type defined in more than one, so
         // pinning the core facade keeps the output deterministic.
-        neededAssemblies.Add("System.Runtime");
+        neededAssemblies.Add(CoreFacadeAssemblyName);
 
         // Create references for all needed SDK assemblies. The identity already carries a
         // public key token rather than a full key, with the PublicKey flag cleared to match.
+        // A missing identity fails here rather than being skipped: every name in this set
+        // is about to be used as a TypeRef resolution scope, and silently omitting the row
+        // left those TypeRefs to degrade to a wrong or nil scope in CopyTypeReferences.
         foreach (var asmName in neededAssemblies)
         {
-            if (_referenceIndex.TryGetIdentity(asmName, out var identity))
+            if (!_referenceIndex.TryGetIdentity(asmName, out var identity))
             {
-                var handle = _metadata.AddAssemblyReference(
-                    GetOrAddString(identity.Name),
-                    identity.Version,
-                    GetOrAddString(identity.CultureName),
-                    GetOrAddBlob(identity.PublicKeyToken.IsDefaultOrEmpty ? [] : [.. identity.PublicKeyToken]),
-                    identity.Flags,
-                    default);
-
-                _newAssemblyRefs[asmName] = handle;
+                throw new PEPackerException(
+                    $"The reference index resolves types to assembly '{asmName}' but has no " +
+                    "identity (version/public key token) for it, so no assembly reference " +
+                    "can be created. The index is inconsistent or the reference-assembly " +
+                    $"directory is missing '{asmName}.dll'.");
             }
+
+            var handle = _metadata.AddAssemblyReference(
+                GetOrAddString(identity.Name),
+                identity.Version,
+                GetOrAddString(identity.CultureName),
+                GetOrAddBlob(identity.PublicKeyToken.IsDefaultOrEmpty ? [] : [.. identity.PublicKeyToken]),
+                identity.Flags,
+                default);
+
+            _newAssemblyRefs[asmName] = handle;
         }
 
         // Copy the references the policy keeps. Both Drop and RetargetToFacades mean the
