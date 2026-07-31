@@ -61,7 +61,7 @@ public partial class AssemblyReferenceRewriter : IDisposable
     // methods are copied before type generic parameters, so emission order is not sort
     // order. Gathered here and emitted by EmitSortedGenericParameters.
     private readonly List<(int SortKey, EntityHandle Parent, GenericParameterHandle Source)> _genericParameters = [];
-    private readonly Dictionary<UserStringHandle, UserStringHandle> _userStringMap = new();
+    private readonly Dictionary<GenericParameterConstraintHandle, GenericParameterConstraintHandle> _genericParamConstraintMap = new();
     private readonly Dictionary<StringHandle, StringHandle> _stringHandleMap = new();
     private readonly Dictionary<GuidHandle, GuidHandle> _guidHandleMap = new();
     private readonly Dictionary<BlobHandle, BlobHandle> _blobHandleMap = new();
@@ -69,8 +69,10 @@ public partial class AssemblyReferenceRewriter : IDisposable
     // New assembly references we create
     private readonly Dictionary<string, AssemblyReferenceHandle> _newAssemblyRefs = new();
 
-    // Method body offset tracking
-    private readonly Dictionary<MethodDefinitionHandle, int> _methodBodyOffsets = new();
+    // The core facade every unresolvable CoreLib type falls back to. One constant so the
+    // phase-3 (CreateAssemblyReferences) and phase-4 (CopyTypeReferences) fallback
+    // decisions cannot diverge.
+    private const string CoreFacadeAssemblyName = "System.Runtime";
 
     // Running 1-based Param table row counter. Each method's ParamList must point
     // at its first Param row (run-indexed), so we hand the current value to
@@ -81,9 +83,10 @@ public partial class AssemblyReferenceRewriter : IDisposable
 
     // Entry point from source
     private MethodDefinitionHandle _sourceEntryPoint;
-    private MethodDefinitionHandle _targetEntryPoint;
 
     private bool _disposed;
+    private bool _rewriteStarted;
+    private bool _rewriteCompleted;
 
     /// <summary>
     /// Creates a rewriter that indexes <paramref name="refAssemblyPath"/> for framework
@@ -149,8 +152,19 @@ public partial class AssemblyReferenceRewriter : IDisposable
         var corHeader = _peReader.PEHeaders.CorHeader;
         if (corHeader != null && corHeader.EntryPointTokenOrRelativeVirtualAddress != 0)
         {
+            // When NativeEntryPoint is set the field holds an RVA into native code, not
+            // a metadata token — there is no MethodDef to remap.
+            if ((corHeader.Flags & CorFlags.NativeEntryPoint) != 0)
+            {
+                throw new PEPackerException(
+                    "The source assembly declares a native entry point " +
+                    "(CorFlags.NativeEntryPoint), which this rewriter does not support.");
+            }
+
+            // The header field is a full mdToken (0x06RRRRRR). Strip the table byte
+            // explicitly rather than relying on SRM to mask it for us.
             _sourceEntryPoint = MetadataTokens.MethodDefinitionHandle(
-                corHeader.EntryPointTokenOrRelativeVirtualAddress);
+                corHeader.EntryPointTokenOrRelativeVirtualAddress & 0x00FFFFFF);
         }
     }
 
@@ -162,6 +176,15 @@ public partial class AssemblyReferenceRewriter : IDisposable
     /// </exception>
     public void Rewrite()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_rewriteStarted)
+        {
+            throw new InvalidOperationException(
+                "Rewrite() has already been called on this instance; the metadata builder " +
+                "is single-use. Create a new AssemblyReferenceRewriter to rewrite again.");
+        }
+        _rewriteStarted = true;
+
         // Phase 0: Refuse input we would only partially copy.
         ValidateSupportedMetadata();
 
@@ -225,6 +248,8 @@ public partial class AssemblyReferenceRewriter : IDisposable
 
         // Phase 14: Copy custom attributes
         CopyCustomAttributes();
+
+        _rewriteCompleted = true;
     }
 
     /// <summary>
@@ -232,12 +257,27 @@ public partial class AssemblyReferenceRewriter : IDisposable
     /// </summary>
     public void Save(Stream output)
     {
+        ArgumentNullException.ThrowIfNull(output);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_rewriteCompleted)
+        {
+            throw new InvalidOperationException(
+                "Save() requires a completed Rewrite() call; there is no rewritten " +
+                "metadata to serialize yet.");
+        }
+
         var metadataRootBuilder = new MetadataRootBuilder(_metadata);
 
-        // Determine the entry point for the new assembly
-        var entryPoint = _sourceEntryPoint.IsNil
-            ? default
-            : _methodDefMap.GetValueOrDefault(_sourceEntryPoint, default);
+        // Determine the entry point for the new assembly. A map miss means the method
+        // was never copied — dropping the entry point silently produced an image that
+        // loaded but could not run.
+        MethodDefinitionHandle entryPoint = default;
+        if (!_sourceEntryPoint.IsNil && !_methodDefMap.TryGetValue(_sourceEntryPoint, out entryPoint))
+        {
+            throw new PEPackerException(
+                $"Entry point method 0x{MetadataTokens.GetToken(_sourceEntryPoint):X8} was " +
+                "never copied, so the rewritten image would silently lose its entry point.");
+        }
 
         var peBuilder = new ManagedPEBuilder(
             CreateHeaderFromSource(),

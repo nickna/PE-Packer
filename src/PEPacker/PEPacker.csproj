@@ -75,6 +75,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="PEPacker.Tests" />
+    <!-- The AOT smoke host shares internal helpers (VersionUtil) rather than keeping a
+         private copy of the version-directory parser that has been fixed repeatedly. -->
+    <InternalsVisibleTo Include="PEPacker.AotSmoke" />
   </ItemGroup>
 
   <ItemGroup>

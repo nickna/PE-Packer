@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using PEPacker;
 using PEPacker.Tests.Infrastructure;
 using Xunit;
+using static PEPacker.Tests.Infrastructure.RewriterTestHelpers;
 
 namespace PEPacker.Tests;
 
@@ -81,17 +82,8 @@ public class MetadataRoundTripTests
             }
         }
 
-        // Tables a PersistedAssemblyBuilder fixture cannot produce. Reaching these needs
-        // hand-built metadata or real compiler output, which is tracked separately.
-        TableIndex[] notProducibleHere =
-        [
-            TableIndex.FieldMarshal,   // MarshalAs on a field or parameter
-            TableIndex.MethodSpec,     // a call to an instantiated generic method
-        ];
-
         var missing = AssemblyReferenceRewriter.SupportedTables
             .Except(covered)
-            .Except(notProducibleHere)
             .OrderBy(t => t.ToString())
             .ToList();
 
@@ -349,6 +341,31 @@ public class MetadataRoundTripTests
         convertIl.Emit(OpCodes.Ret);
 
         type.CreateType();
+
+        // Calls to instantiated generic methods, which are what produce MethodSpec rows:
+        // one over this module's own MethodDef and one over a MemberRef into CoreLib, so
+        // both shapes of MethodSpec.Method survive the rewrite.
+        var user = module.DefineType("Fx.SpecUser", TypeAttributes.Public);
+
+        var identity = user.DefineMethod("Identity",
+            MethodAttributes.Public | MethodAttributes.Static);
+        var identityParams = identity.DefineGenericParameters("V");
+        identity.SetReturnType(identityParams[0]);
+        identity.SetParameters(identityParams[0]);
+        var identityIl = identity.GetILGenerator();
+        identityIl.Emit(OpCodes.Ldarg_0);
+        identityIl.Emit(OpCodes.Ret);
+
+        var useSpecs = user.DefineMethod("UseSpecs",
+            MethodAttributes.Public | MethodAttributes.Static, typeof(int[]), Type.EmptyTypes);
+        var useSpecsIl = useSpecs.GetILGenerator();
+        useSpecsIl.Emit(OpCodes.Ldstr, "spec");
+        useSpecsIl.Emit(OpCodes.Call, identity.MakeGenericMethod(typeof(string)));
+        useSpecsIl.Emit(OpCodes.Pop);
+        useSpecsIl.Emit(OpCodes.Call, typeof(Array).GetMethod("Empty")!.MakeGenericMethod(typeof(int)));
+        useSpecsIl.Emit(OpCodes.Ret);
+
+        user.CreateType();
     }
 
     private static void BuildInteropFixture(ModuleBuilder module)
@@ -380,29 +397,32 @@ public class MetadataRoundTripTests
         overlapped.DefineField("AsFloat", typeof(float), FieldAttributes.Public).SetOffset(0);
         overlapped.DefineField("Tail", typeof(short), FieldAttributes.Public).SetOffset(4);
         overlapped.CreateType();
+
+        // [MarshalAs] is a pseudo-attribute: PersistedAssemblyBuilder lowers it to a
+        // FieldMarshal row rather than a CustomAttribute row. The padding fields push the
+        // marshalled field to a high row so its HasFieldMarshal coded index (Field = tag 0)
+        // sorts AFTER the marshalled parameter's (Param row 1, tag 1) even though fields
+        // are copied first — the emit-sorted path is exercised, not just the copy.
+        var marshalled = module.DefineType("Fx.Marshalled", TypeAttributes.Public);
+        for (int i = 0; i < 3; i++)
+        {
+            marshalled.DefineField($"_pad{i}", typeof(int), FieldAttributes.Private);
+        }
+
+        var message = marshalled.DefineField("Message", typeof(string), FieldAttributes.Public);
+        message.SetCustomAttribute(new CustomAttributeBuilder(
+            typeof(MarshalAsAttribute).GetConstructor([typeof(UnmanagedType)])!,
+            [UnmanagedType.LPWStr]));
+
+        var format = marshalled.DefineMethod("Format",
+            MethodAttributes.Public | MethodAttributes.Static, typeof(void), [typeof(string)]);
+        format.DefineParameter(1, ParameterAttributes.None, "text").SetCustomAttribute(
+            new CustomAttributeBuilder(
+                typeof(MarshalAsAttribute).GetConstructor([typeof(UnmanagedType)])!,
+                [UnmanagedType.LPStr]));
+        format.GetILGenerator().Emit(OpCodes.Ret);
+
+        marshalled.CreateType();
     }
 
-    // ---- helpers --------------------------------------------------------------
-
-    private static byte[] Build(string name, Action<ModuleBuilder> emit)
-    {
-        var ab = new PersistedAssemblyBuilder(new AssemblyName(name), typeof(object).Assembly);
-        emit(ab.DefineDynamicModule(name));
-
-        using var stream = new MemoryStream();
-        ab.Save(stream);
-        return stream.ToArray();
-    }
-
-    private static byte[] Rewrite(byte[] source)
-    {
-        using var rewriter = new AssemblyReferenceRewriter(
-            new MemoryStream(source), RuntimeEnvironment.GetRuntimeDirectory());
-
-        rewriter.Rewrite();
-
-        using var output = new MemoryStream();
-        rewriter.Save(output);
-        return output.ToArray();
-    }
 }

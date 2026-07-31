@@ -15,9 +15,9 @@ namespace PEPacker.Tests.Infrastructure;
 /// </remarks>
 internal sealed class SignatureStringProvider : ISignatureTypeProvider<string, object?>
 {
-    private readonly MetadataReader _reader;
-
-    public SignatureStringProvider(MetadataReader reader) => _reader = reader;
+    // Stateless: every interface member receives the MetadataReader it needs as an
+    // argument, so one shared instance serves signatures from any assembly.
+    public static readonly SignatureStringProvider Instance = new();
 
     public string GetPrimitiveType(PrimitiveTypeCode typeCode) => typeCode.ToString();
 

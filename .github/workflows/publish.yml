@@ -9,8 +9,79 @@ permissions:
   contents: write
 
 jobs:
+  # A tag can point at a commit that never went through a master push/PR run, so the two
+  # load-bearing AOT gates from ci.yml are replicated here and the publish job depends on
+  # them. Without this, tagging such a commit could ship a package that breaks AOT consumers.
+
+  # Mirrors the "AOT analyzer ratchet" step of ci.yml's build-and-test job. PEPacker is
+  # published inside Native AOT applications, so it has to stay free of trim/AOT analyzer
+  # warnings; the surface is ratcheted at zero.
+  #
+  # --no-incremental is load-bearing: analyzer warnings are emitted only when the
+  # compiler actually runs, so an up-to-date build reports nothing and would let this
+  # pass vacuously. Matching on the IL prefix rather than a list of codes means a
+  # warning class we have not seen yet still fails.
+  aot-analyzer-ratchet:
+    name: AOT analyzer ratchet
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore PE-Packer.slnx
+
+      - name: AOT analyzer ratchet
+        run: |
+          set -o pipefail
+          dotnet build src/PEPacker/PEPacker.csproj --no-restore --configuration Release \
+            --no-incremental 2>&1 | tee analyzer-build.log
+          if grep -E "warning IL[0-9]+" analyzer-build.log; then
+            echo "::error::New trim/AOT analyzer warnings above. PEPacker must stay AOT-clean; \
+          suppress with [UnconditionalSuppressMessage] and a justification only when the \
+          warning is provably inapplicable."
+            exit 1
+          fi
+          echo "No trim/AOT analyzer warnings."
+
+  # Mirrors ci.yml's aot-smoke job: publishes a real native binary and drives PEPacker
+  # through it, covering the "works under JIT, breaks under AOT" class the managed test
+  # suite can never see.
+  aot-smoke:
+    name: aot-smoke (linux-x64, native)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # ILC shells out to a C++ linker; without these the link step fails rather than the
+      # test failing, which is a confusing way to learn the toolchain is incomplete.
+      - name: Install Native AOT prerequisites
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Publish the smoke host as Native AOT
+        run: |
+          dotnet publish tests/PEPacker.AotSmoke/PEPacker.AotSmoke.csproj \
+            --configuration Release -r linux-x64
+
+      # The host prints one line per check and exits non-zero if any required step failed, so
+      # the log says what was covered rather than only whether it passed.
+      - name: Run the smoke host
+        run: ./tests/PEPacker.AotSmoke/bin/Release/net10.0/linux-x64/publish/PEPacker.AotSmoke
+
   publish:
     runs-on: ubuntu-latest
+    needs: [aot-analyzer-ratchet, aot-smoke]
 
     steps:
       - uses: actions/checkout@v4
@@ -25,13 +96,17 @@ jobs:
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
 
       - name: Restore dependencies
-        run: dotnet restore
+        run: dotnet restore PE-Packer.slnx
 
+      # -p:Version must be passed to the build, not only to pack: pack --no-build reuses the
+      # already-compiled DLLs, so a version set only at pack time changes the nuspec while the
+      # shipped assemblies keep AssemblyVersion/FileVersion/InformationalVersion 1.0.0 from
+      # Directory.Build.props.
       - name: Build
-        run: dotnet build --no-restore --configuration Release
+        run: dotnet build PE-Packer.slnx --no-restore --configuration Release -p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Test
-        run: dotnet test --no-build --configuration Release --verbosity normal
+        run: dotnet test PE-Packer.slnx --no-build --configuration Release --verbosity normal -p:Version=${{ steps.version.outputs.VERSION }}
 
       - name: Pack package
         run: dotnet pack src/PEPacker/PEPacker.csproj --no-build --configuration Release -p:Version=${{ steps.version.outputs.VERSION }} --output ./nupkg
@@ -47,7 +122,7 @@ jobs:
         run: dotnet nuget push ./nupkg/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           files: ./nupkg/*

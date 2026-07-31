@@ -23,13 +23,23 @@ internal static class RewriterFixtures
         Build("System.Private.CoreLib", new Version(10, 0, 0, 0), ns, typeName);
 
     /// <summary>
-    /// A minimal assembly with a type reference scoped to a named assembly.
+    /// A minimal assembly with an <c>AssemblyRef</c> to <paramref name="referencedAssembly"/>
+    /// and, when <paramref name="addTypeReference"/> is set, a <c>TypeRef</c> scoped to it.
     /// </summary>
+    /// <param name="referencedAssembly">Simple name of the referenced assembly.</param>
+    /// <param name="referencedVersion">Version of the referenced assembly.</param>
+    /// <param name="ns">Namespace of the referenced type.</param>
+    /// <param name="typeName">Name of the referenced type.</param>
+    /// <param name="addTypeReference">
+    /// When <see langword="false"/>, the reference row exists but nothing resolves through
+    /// it — a "leaked" reference, which is the shape a policy can drop safely.
+    /// </param>
     internal static byte[] Build(
         string referencedAssembly,
         Version referencedVersion,
         string ns,
-        string typeName)
+        string typeName,
+        bool addTypeReference = true)
     {
         var metadata = new MetadataBuilder();
 
@@ -56,10 +66,13 @@ internal static class RewriterFixtures
             default,
             default);
 
-        metadata.AddTypeReference(
-            reference,
-            metadata.GetOrAddString(ns),
-            metadata.GetOrAddString(typeName));
+        if (addTypeReference)
+        {
+            metadata.AddTypeReference(
+                reference,
+                metadata.GetOrAddString(ns),
+                metadata.GetOrAddString(typeName));
+        }
 
         // The <Module> pseudo-type must be row 1 of TypeDef.
         metadata.AddTypeDefinition(

@@ -41,7 +41,7 @@ public static class ReferencePolicy
     /// <summary>
     /// The assembly whose references the rewriter exists to retarget.
     /// </summary>
-    private const string CoreLib = "System.Private.CoreLib";
+    private const string CoreLib = WellKnownAssemblies.CoreLib;
 
     /// <summary>
     /// Preserves the behaviour of releases up to and including 1.0.4: retarget

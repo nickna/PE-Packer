@@ -1,7 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 
 namespace PEPacker.Bundling;
 
@@ -143,7 +142,7 @@ public static class SdkBundlerDetector
     /// </summary>
     private static string? FindHostModelDll()
     {
-        var dotnetRoot = GetDotNetRoot();
+        var dotnetRoot = DotNetRoot.Find();
         if (dotnetRoot == null)
         {
             return null;
@@ -174,121 +173,36 @@ public static class SdkBundlerDetector
     /// <summary>
     /// Finds the highest version SDK directory.
     /// </summary>
+    /// <remarks>
+    /// Ordered by parsed version, never by name: "10.0.9" sorts above "10.0.10" as a string, and
+    /// picking the wrong SDK here means reflecting into a <c>Microsoft.NET.HostModel.dll</c> whose
+    /// <c>Bundler</c> signature is not the one on the machine's newest SDK.
+    /// </remarks>
     private static string? FindHighestSdkVersion(string sdkDir)
     {
         try
         {
-            var directories = Directory.GetDirectories(sdkDir);
-            Version? bestVersion = null;
+            VersionUtil.Parsed? bestVersion = null;
             string? bestName = null;
 
-            foreach (var dir in directories)
+            foreach (var dir in Directory.GetDirectories(sdkDir))
             {
                 var name = Path.GetFileName(dir);
-                var cleanVersion = CleanVersionString(name);
 
-                if (Version.TryParse(cleanVersion, out var version))
+                if (VersionUtil.TryParse(name, out var version)
+                    && (bestVersion is null || version > bestVersion.Value))
                 {
-                    if (bestVersion == null || version > bestVersion)
-                    {
-                        bestVersion = version;
-                        bestName = name;
-                    }
+                    bestVersion = version;
+                    bestName = name;
                 }
             }
 
             return bestName;
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return null;
         }
-    }
-
-    /// <summary>
-    /// Removes preview/rc suffixes from version strings.
-    /// </summary>
-    private static string CleanVersionString(string version)
-    {
-        var dashIndex = version.IndexOf('-');
-        return dashIndex > 0 ? version[..dashIndex] : version;
-    }
-
-    /// <summary>
-    /// Gets the .NET root directory.
-    /// </summary>
-    private static string? GetDotNetRoot()
-    {
-        // First try DOTNET_ROOT environment variable
-        var dotnetRoot = Environment.GetEnvironmentVariable("DOTNET_ROOT");
-        if (!string.IsNullOrEmpty(dotnetRoot) && Directory.Exists(dotnetRoot))
-        {
-            return dotnetRoot;
-        }
-
-        // Try default locations based on platform
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-            var path = Path.Combine(programFiles, "dotnet");
-            if (Directory.Exists(path))
-            {
-                return path;
-            }
-        }
-        else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        {
-            var paths = new[] { "/usr/local/share/dotnet", "/opt/homebrew/opt/dotnet/libexec" };
-            foreach (var path in paths)
-            {
-                if (Directory.Exists(path))
-                {
-                    return path;
-                }
-            }
-        }
-        else // Linux
-        {
-            var paths = new[] { "/usr/share/dotnet", "/usr/lib/dotnet", "/opt/dotnet" };
-            foreach (var path in paths)
-            {
-                if (Directory.Exists(path))
-                {
-                    return path;
-                }
-            }
-        }
-
-        // Try to derive from runtime location
-        try
-        {
-            var runtimeDir = RuntimeEnvironment.GetRuntimeDirectory();
-            if (!string.IsNullOrEmpty(runtimeDir))
-            {
-                // Navigate up: shared/Microsoft.NETCore.App/version -> dotnet root
-                var dotnetRootFromRuntime = Path.GetFullPath(Path.Combine(runtimeDir, "..", "..", ".."));
-                if (Directory.Exists(dotnetRootFromRuntime))
-                {
-                    return dotnetRootFromRuntime;
-                }
-            }
-        }
-        catch
-        {
-            // Ignore errors
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Resets the cached detection result (for testing purposes).
-    /// </summary>
-    internal static void ResetCache()
-    {
-        // Note: Lazy<T> cannot be reset, but this method exists for potential
-        // future test infrastructure needs. In tests, you would typically
-        // mock the detection at a higher level.
     }
 
     /// <summary>

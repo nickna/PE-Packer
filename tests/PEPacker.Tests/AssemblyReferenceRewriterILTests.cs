@@ -3,10 +3,9 @@ using System.Reflection.Emit;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
-using System.Runtime.InteropServices;
-using System.Runtime.Loader;
 using PEPacker;
 using Xunit;
+using static PEPacker.Tests.Infrastructure.RewriterTestHelpers;
 
 namespace PEPacker.Tests;
 
@@ -261,44 +260,6 @@ public class AssemblyReferenceRewriterILTests
     }
 
     // ---- helpers --------------------------------------------------------------
-
-    private static byte[] Build(string name, Action<ModuleBuilder> emit)
-    {
-        var ab = new PersistedAssemblyBuilder(new AssemblyName(name), typeof(object).Assembly);
-        emit(ab.DefineDynamicModule(name));
-
-        using var stream = new MemoryStream();
-        ab.Save(stream);
-        return stream.ToArray();
-    }
-
-    private static byte[] Rewrite(byte[] source)
-    {
-        // Only a directory containing System.Runtime.dll and the BCL facades is needed;
-        // the shared-framework runtime directory always qualifies.
-        using var rewriter = new AssemblyReferenceRewriter(
-            new MemoryStream(source), RuntimeEnvironment.GetRuntimeDirectory());
-
-        rewriter.Rewrite();
-
-        using var output = new MemoryStream();
-        rewriter.Save(output);
-        return output.ToArray();
-    }
-
-    private static void Execute(byte[] image, Action<Assembly> assertions)
-    {
-        var alc = new AssemblyLoadContext("rewritten-il-fixture", isCollectible: true);
-        try
-        {
-            using var ms = new MemoryStream(image);
-            assertions(alc.LoadFromStream(ms));
-        }
-        finally
-        {
-            alc.Unload();
-        }
-    }
 
     private static (byte[] IL, MetadataReader Reader) ReadMethodBody(byte[] image, string methodName)
     {

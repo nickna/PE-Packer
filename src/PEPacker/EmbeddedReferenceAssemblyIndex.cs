@@ -43,7 +43,29 @@ public sealed class EmbeddedReferenceAssemblyIndex : IReferenceAssemblyIndex
     /// </summary>
     public const string EmbeddedTargetFramework = "net10.0";
 
-    private const string ResourceName = "PEPacker.Resources.refindex-net10.0.bin";
+    /// <summary>
+    /// Derived from <see cref="EmbeddedTargetFramework"/> rather than spelled out, so the two
+    /// cannot say different things about which framework this package embeds.
+    /// </summary>
+    private const string ResourceName = $"PEPacker.Resources.refindex-{EmbeddedTargetFramework}.bin";
+
+    /// <summary>
+    /// Ceiling on a declared entry count, so corrupt data is rejected rather than sized into.
+    /// </summary>
+    /// <remarks>
+    /// The counts are read from the data and used to allocate, so a corrupt <c>int.MaxValue</c>
+    /// exhausted memory before a single entry had been parsed — the failure arrived as an
+    /// <see cref="OutOfMemoryException"/> from somewhere unrelated. The real index holds a few
+    /// thousand types; this is orders of magnitude above any plausible framework and still far
+    /// below anything that can hurt.
+    /// </remarks>
+    private const int MaxEntryCount = 1_000_000;
+
+    /// <summary>
+    /// Upper bound on capacity pre-allocated from a declared count, which is untrusted until its
+    /// entries have actually been read.
+    /// </summary>
+    private const int MaxPreallocatedCapacity = 8192;
 
     private static readonly Lazy<EmbeddedReferenceAssemblyIndex> Net10 =
         new(() => FromResource(ResourceName), LazyThreadSafetyMode.ExecutionAndPublication);
@@ -74,9 +96,25 @@ public sealed class EmbeddedReferenceAssemblyIndex : IReferenceAssemblyIndex
 
             var assemblies = ReadAssemblies(reader, out _identities);
             _owners = ReadOwners(reader, assemblies);
+
+            // Surplus data means the counts do not describe the file, so some entries are being
+            // dropped. Without this check that loaded "successfully" and the index simply did not
+            // contain everything it was built with — a corruption that shows up much later as an
+            // unresolved type rather than as a bad file.
+            if (reader.ReadLine() is not null)
+            {
+                throw new PEPackerException(
+                    "The reference index has data after its last type entry, so its declared " +
+                    "counts do not describe the file.");
+            }
         }
-        catch (Exception ex) when (ex is InvalidDataException or FormatException or IOException)
+        catch (Exception ex) when (ex is InvalidDataException or FormatException or IOException
+            or ArgumentException or OverflowException)
         {
+            // ArgumentException and OverflowException are in the filter because Version.Parse and
+            // int.Parse raise them on corrupt input: an empty version string is an
+            // ArgumentException, a 20-digit ordinal an OverflowException. Both used to escape this
+            // constructor unwrapped, contradicting the documented contract.
             throw new PEPackerException("The reference index data could not be read.", ex);
         }
     }
@@ -118,9 +156,9 @@ public sealed class EmbeddedReferenceAssemblyIndex : IReferenceAssemblyIndex
     /// <param name="typeNames">Every type name <paramref name="source"/> should be asked about.</param>
     /// <param name="assemblyNames">
     /// Every assembly name to capture an identity for. Deriving these from the types alone would
-    /// drop facades that own no publicly resolvable type — 36 of 167 in the net10.0 reference pack
-    /// — and quietly make the serialised index answer <see cref="TryGetIdentity"/> differently
-    /// from the one it was built from.
+    /// drop the facades that own no publicly resolvable type — a substantial minority of a
+    /// reference pack — and quietly make the serialised index answer
+    /// <see cref="TryGetIdentity"/> differently from the one it was built from.
     /// </param>
     /// <param name="destination">Where to write the compressed data.</param>
     /// <remarks>
@@ -225,8 +263,8 @@ public sealed class EmbeddedReferenceAssemblyIndex : IReferenceAssemblyIndex
         out Dictionary<string, AssemblyIdentity> byName)
     {
         var count = ReadCount(reader, "assembly count");
-        var assemblies = new List<AssemblyIdentity>(count);
-        byName = new Dictionary<string, AssemblyIdentity>(count, StringComparer.Ordinal);
+        var assemblies = new List<AssemblyIdentity>(Capacity(count));
+        byName = new Dictionary<string, AssemblyIdentity>(Capacity(count), StringComparer.Ordinal);
 
         for (int i = 0; i < count; i++)
         {
@@ -258,7 +296,7 @@ public sealed class EmbeddedReferenceAssemblyIndex : IReferenceAssemblyIndex
         List<AssemblyIdentity> assemblies)
     {
         var count = ReadCount(reader, "type count");
-        var owners = new Dictionary<string, AssemblyIdentity>(count, StringComparer.Ordinal);
+        var owners = new Dictionary<string, AssemblyIdentity>(Capacity(count), StringComparer.Ordinal);
 
         for (int i = 0; i < count; i++)
         {
@@ -287,8 +325,25 @@ public sealed class EmbeddedReferenceAssemblyIndex : IReferenceAssemblyIndex
     private static int ReadCount(TextReader reader, string what)
     {
         var line = reader.ReadLine();
-        return int.TryParse(line, CultureInfo.InvariantCulture, out var count) && count >= 0
-            ? count
-            : throw new PEPackerException($"Reference index has no valid {what}.");
+
+        if (!int.TryParse(line, CultureInfo.InvariantCulture, out var count) || count < 0)
+        {
+            throw new PEPackerException($"Reference index has no valid {what}.");
+        }
+
+        if (count > MaxEntryCount)
+        {
+            throw new PEPackerException(
+                $"Reference index declares a {what} of {count.ToString(CultureInfo.InvariantCulture)}, " +
+                $"beyond the {MaxEntryCount.ToString(CultureInfo.InvariantCulture)} this format " +
+                "accepts. The data is corrupt.");
+        }
+
+        return count;
     }
+
+    /// <summary>
+    /// Clamps a declared count before it is used as an allocation size.
+    /// </summary>
+    private static int Capacity(int count) => Math.Min(count, MaxPreallocatedCapacity);
 }

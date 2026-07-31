@@ -117,8 +117,12 @@ public partial class AssemblyReferenceRewriter
                         _ilStream.WriteByte(0);
                 }
 
-                // Determine if we need fat exception handlers
-                bool needsFatHandlers = false;
+                // Small format packs offsets/lengths into 2 and 1 bytes, and its DataSize
+                // is a single byte covering the 4-byte section header plus 12 bytes per
+                // region — so at 21 regions (4 + 21*12 = 256) the count itself overflows
+                // even when every individual offset fits. That overflow used to be cast
+                // straight to a zero byte, silently corrupting the method body.
+                bool needsFatHandlers = 4 + (exceptionRegions.Length * 12) > 0xFF;
                 foreach (var region in exceptionRegions)
                 {
                     if (region.TryOffset > 0xFFFF || region.TryLength > 0xFF ||
@@ -131,7 +135,7 @@ public partial class AssemblyReferenceRewriter
 
                 if (needsFatHandlers)
                 {
-                    // Fat exception header
+                    // Fat exception header: 3-byte DataSize.
                     int dataSize = 4 + (exceptionRegions.Length * 24);
                     _ilStream.WriteByte(FatExceptionSectionFlag);
                     _ilStream.WriteByte((byte)(dataSize & 0xFF));
@@ -140,38 +144,17 @@ public partial class AssemblyReferenceRewriter
 
                     foreach (var region in exceptionRegions)
                     {
-                        int flags2 = region.Kind switch
-                        {
-                            ExceptionRegionKind.Catch => 0,
-                            ExceptionRegionKind.Filter => 1,
-                            ExceptionRegionKind.Finally => 2,
-                            ExceptionRegionKind.Fault => 4,
-                            _ => 0
-                        };
-                        _ilStream.WriteInt32(flags2);
+                        _ilStream.WriteInt32(GetExceptionRegionFlags(region.Kind));
                         _ilStream.WriteInt32(region.TryOffset);
                         _ilStream.WriteInt32(region.TryLength);
                         _ilStream.WriteInt32(region.HandlerOffset);
                         _ilStream.WriteInt32(region.HandlerLength);
-
-                        if (region.Kind == ExceptionRegionKind.Catch)
-                        {
-                            var catchType = MapEntityHandle(region.CatchType);
-                            _ilStream.WriteInt32(MetadataTokens.GetToken(catchType));
-                        }
-                        else if (region.Kind == ExceptionRegionKind.Filter)
-                        {
-                            _ilStream.WriteInt32(region.FilterOffset);
-                        }
-                        else
-                        {
-                            _ilStream.WriteInt32(0);
-                        }
+                        _ilStream.WriteInt32(GetExceptionRegionClassTokenOrFilterOffset(region));
                     }
                 }
                 else
                 {
-                    // Small exception header
+                    // Small exception header: 1-byte DataSize.
                     int dataSize = 4 + (exceptionRegions.Length * 12);
                     _ilStream.WriteByte(SmallExceptionSectionFlag);
                     _ilStream.WriteByte((byte)dataSize);
@@ -179,33 +162,12 @@ public partial class AssemblyReferenceRewriter
 
                     foreach (var region in exceptionRegions)
                     {
-                        ushort flags2 = region.Kind switch
-                        {
-                            ExceptionRegionKind.Catch => 0,
-                            ExceptionRegionKind.Filter => 1,
-                            ExceptionRegionKind.Finally => 2,
-                            ExceptionRegionKind.Fault => 4,
-                            _ => 0
-                        };
-                        _ilStream.WriteUInt16(flags2);
+                        _ilStream.WriteUInt16((ushort)GetExceptionRegionFlags(region.Kind));
                         _ilStream.WriteUInt16((ushort)region.TryOffset);
                         _ilStream.WriteByte((byte)region.TryLength);
                         _ilStream.WriteUInt16((ushort)region.HandlerOffset);
                         _ilStream.WriteByte((byte)region.HandlerLength);
-
-                        if (region.Kind == ExceptionRegionKind.Catch)
-                        {
-                            var catchType = MapEntityHandle(region.CatchType);
-                            _ilStream.WriteInt32(MetadataTokens.GetToken(catchType));
-                        }
-                        else if (region.Kind == ExceptionRegionKind.Filter)
-                        {
-                            _ilStream.WriteInt32(region.FilterOffset);
-                        }
-                        else
-                        {
-                            _ilStream.WriteInt32(0);
-                        }
+                        _ilStream.WriteInt32(GetExceptionRegionClassTokenOrFilterOffset(region));
                     }
                 }
             }
@@ -213,6 +175,29 @@ public partial class AssemblyReferenceRewriter
 
         return methodBodyOffset;
     }
+
+    /// <summary>ECMA-335 II.25.4.6 — exception clause flags.</summary>
+    private static int GetExceptionRegionFlags(ExceptionRegionKind kind) => kind switch
+    {
+        ExceptionRegionKind.Catch => 0,
+        ExceptionRegionKind.Filter => 1,
+        ExceptionRegionKind.Finally => 2,
+        ExceptionRegionKind.Fault => 4,
+        _ => throw new PEPackerException(
+            $"Unknown exception region kind '{kind}'; silently emitting it as a catch " +
+            "clause would corrupt the method's exception handling.")
+    };
+
+    /// <summary>
+    /// The final dword of an exception clause: the mapped catch-type token for a catch,
+    /// the filter offset for a filter, and zero otherwise.
+    /// </summary>
+    private int GetExceptionRegionClassTokenOrFilterOffset(ExceptionRegion region) => region.Kind switch
+    {
+        ExceptionRegionKind.Catch => MetadataTokens.GetToken(MapEntityHandle(region.CatchType)),
+        ExceptionRegionKind.Filter => region.FilterOffset,
+        _ => 0
+    };
 
     /// <summary>
     /// Walks a method body and rewrites every metadata token operand in place.
@@ -251,18 +236,22 @@ public partial class AssemblyReferenceRewriter
                     break;
 
                 case ILOperandKind.Byte:
+                    RequireBytes(ilBytes, offset, 1, instructionStart);
                     offset += 1;
                     break;
 
                 case ILOperandKind.Short:
+                    RequireBytes(ilBytes, offset, 2, instructionStart);
                     offset += 2;
                     break;
 
                 case ILOperandKind.Int:
+                    RequireBytes(ilBytes, offset, 4, instructionStart);
                     offset += 4;
                     break;
 
                 case ILOperandKind.Long:
+                    RequireBytes(ilBytes, offset, 8, instructionStart);
                     offset += 8;
                     break;
 
@@ -308,6 +297,15 @@ public partial class AssemblyReferenceRewriter
         }
     }
 
+    /// <summary>
+    /// Maps an IL token operand into the assembly being built.
+    /// </summary>
+    /// <remarks>
+    /// Fail-closed, mirroring <see cref="MapEntityHandle"/>: every arm previously fell
+    /// back to the source row on a miss, which silently kept a stale row number, and
+    /// unknown tables passed through untouched. Both are the exact silent-fallback
+    /// pattern that already produced a class of corruption bugs.
+    /// </remarks>
     private int MapMetadataToken(int token)
     {
         var tableIndex = (token >> MetadataTableShift) & MetadataTableMask;
@@ -319,59 +317,43 @@ public partial class AssemblyReferenceRewriter
         return tableIndex switch
         {
             TableTypeRef =>
-                MetadataTokens.GetToken(_typeRefMap.GetValueOrDefault(
-                    MetadataTokens.TypeReferenceHandle(rowNumber),
-                    MetadataTokens.TypeReferenceHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.TypeReferenceHandle(rowNumber))),
 
             TableTypeDef =>
-                MetadataTokens.GetToken(_typeDefMap.GetValueOrDefault(
-                    MetadataTokens.TypeDefinitionHandle(rowNumber),
-                    MetadataTokens.TypeDefinitionHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.TypeDefinitionHandle(rowNumber))),
 
             TableFieldDef =>
-                MetadataTokens.GetToken(_fieldDefMap.GetValueOrDefault(
-                    MetadataTokens.FieldDefinitionHandle(rowNumber),
-                    MetadataTokens.FieldDefinitionHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.FieldDefinitionHandle(rowNumber))),
 
             TableMethodDef =>
-                MetadataTokens.GetToken(_methodDefMap.GetValueOrDefault(
-                    MetadataTokens.MethodDefinitionHandle(rowNumber),
-                    MetadataTokens.MethodDefinitionHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.MethodDefinitionHandle(rowNumber))),
 
             TableMemberRef =>
-                MetadataTokens.GetToken(_memberRefMap.GetValueOrDefault(
-                    MetadataTokens.MemberReferenceHandle(rowNumber),
-                    MetadataTokens.MemberReferenceHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.MemberReferenceHandle(rowNumber))),
 
             TableStandAloneSig =>
-                MetadataTokens.GetToken(_standAloneSigMap.GetValueOrDefault(
-                    MetadataTokens.StandaloneSignatureHandle(rowNumber),
-                    MetadataTokens.StandaloneSignatureHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.StandaloneSignatureHandle(rowNumber))),
 
             TableTypeSpec =>
-                MetadataTokens.GetToken(_typeSpecMap.GetValueOrDefault(
-                    MetadataTokens.TypeSpecificationHandle(rowNumber),
-                    MetadataTokens.TypeSpecificationHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.TypeSpecificationHandle(rowNumber))),
 
             TableMethodSpec =>
-                MetadataTokens.GetToken(_methodSpecMap.GetValueOrDefault(
-                    MetadataTokens.MethodSpecificationHandle(rowNumber),
-                    MetadataTokens.MethodSpecificationHandle(rowNumber))),
+                MetadataTokens.GetToken(MapEntityHandle(MetadataTokens.MethodSpecificationHandle(rowNumber))),
 
+            // Strings are interned into the target #US heap on first use;
+            // GetOrAddUserString makes repeat additions idempotent.
             TableUserString =>
-                MetadataTokens.GetToken(_userStringMap.GetValueOrDefault(
-                    MetadataTokens.UserStringHandle(rowNumber),
-                    AddUserString(MetadataTokens.UserStringHandle(rowNumber)))),
+                MetadataTokens.GetToken(AddUserString(MetadataTokens.UserStringHandle(rowNumber))),
 
-            _ => token
+            _ => throw new PEPackerException(
+                $"IL token 0x{token:X8} references metadata table 0x{tableIndex:X2}, " +
+                "which this rewriter does not map; passing it through unmapped would " +
+                "point at an arbitrary row in the rewritten assembly.")
         };
     }
 
     private UserStringHandle AddUserString(UserStringHandle sourceHandle)
     {
-        var str = _reader.GetUserString(sourceHandle);
-        var newHandle = _metadata.GetOrAddUserString(str);
-        _userStringMap[sourceHandle] = newHandle;
-        return newHandle;
+        return _metadata.GetOrAddUserString(_reader.GetUserString(sourceHandle));
     }
 }

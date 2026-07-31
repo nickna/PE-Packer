@@ -7,90 +7,131 @@ public partial class AssemblyReferenceRewriter
 {
     private void CopyTypeReferences()
     {
-        // Process in order to handle nested types correctly
+        // Rows are visited in source order; a nested TypeRef whose parent row comes later
+        // is handled by copying the parent on demand (see CopyTypeReference), which was
+        // previously a raw KeyNotFoundException from a bare indexer.
+        var inProgress = new HashSet<TypeReferenceHandle>();
         foreach (var typeRefHandle in _reader.TypeReferences)
         {
-            var typeRef = _reader.GetTypeReference(typeRefHandle);
-            var name = _reader.GetString(typeRef.Name);
-            var ns = _reader.GetString(typeRef.Namespace);
-            var fullName = string.IsNullOrEmpty(ns) ? name : $"{ns}.{name}";
+            CopyTypeReference(typeRefHandle, inProgress);
+        }
+    }
 
-            EntityHandle newResolutionScope;
+    private TypeReferenceHandle CopyTypeReference(
+        TypeReferenceHandle typeRefHandle,
+        HashSet<TypeReferenceHandle> inProgress)
+    {
+        // Already copied — either in source order or on demand as another row's parent.
+        if (_typeRefMap.TryGetValue(typeRefHandle, out var alreadyCopied))
+        {
+            return alreadyCopied;
+        }
 
-            switch (typeRef.ResolutionScope.Kind)
-            {
-                case HandleKind.AssemblyReference:
+        var typeRef = _reader.GetTypeReference(typeRefHandle);
+        var name = _reader.GetString(typeRef.Name);
+        var ns = _reader.GetString(typeRef.Namespace);
+        var fullName = GetFullTypeName(typeRef);
+
+        if (!inProgress.Add(typeRefHandle))
+        {
+            throw new PEPackerException(
+                $"Type reference '{fullName}' (0x{MetadataTokens.GetToken(typeRefHandle):X8}) " +
+                "is its own resolution-scope ancestor; the nested-type chain is cyclic and " +
+                "the metadata is malformed.");
+        }
+
+        EntityHandle newResolutionScope;
+
+        switch (typeRef.ResolutionScope.Kind)
+        {
+            case HandleKind.AssemblyReference:
+                {
+                    var oldAsmRef = (AssemblyReferenceHandle)typeRef.ResolutionScope;
+                    var oldAsmName = _reader.GetString(_reader.GetAssemblyReference(oldAsmRef).Name);
+
+                    if (_referencePolicy(oldAsmName) == ReferenceAction.RetargetToFacades)
                     {
-                        var oldAsmRef = (AssemblyReferenceHandle)typeRef.ResolutionScope;
-                        var oldAsmName = _reader.GetString(_reader.GetAssemblyReference(oldAsmRef).Name);
-
-                        if (_referencePolicy(oldAsmName) == ReferenceAction.RetargetToFacades)
+                        // Redirect to the appropriate SDK assembly, defaulting unindexed
+                        // types to the core facade — the same decision phase 3 made when
+                        // it created the rows this lookup expects to find.
+                        var targetAsm = _referenceIndex.TryResolveType(fullName, out var owner)
+                            ? owner.Name
+                            : CoreFacadeAssemblyName;
+                        if (!_newAssemblyRefs.TryGetValue(targetAsm, out var facadeRef))
                         {
-                            // Redirect to appropriate SDK assembly
-                            var targetAsm = _referenceIndex.TryResolveType(fullName, out var owner)
-                                ? owner.Name
-                                : "System.Runtime";
-                            newResolutionScope = _newAssemblyRefs.GetValueOrDefault(targetAsm,
-                                _newAssemblyRefs.GetValueOrDefault("System.Runtime", default));
+                            // Phase 3 computes the needed set with the same policy, index
+                            // and fallback, so a miss means the two phases diverged. A nil
+                            // scope is never an acceptable stand-in: per ECMA-335 II.22.38
+                            // it redirects resolution to the ExportedType table.
+                            throw new PEPackerException(
+                                $"Type reference '{fullName}' retargets to assembly " +
+                                $"'{targetAsm}', but no reference to that assembly was " +
+                                "created; CreateAssemblyReferences and CopyTypeReferences " +
+                                "disagree about which assemblies are needed.");
                         }
-                        else
-                        {
-                            // A dropped reference has no row, so this map can legitimately have no
-                            // entry. A bare indexer turned that into a KeyNotFoundException naming
-                            // neither the type nor the reference — matching the ModuleReference arm
-                            // below is the least a caller needs.
-                            if (!_assemblyRefMap.TryGetValue(oldAsmRef, out var newAsmRef))
-                            {
-                                throw new PEPackerException(
-                                    $"Type reference '{fullName}' is scoped to assembly reference " +
-                                    $"'{oldAsmName}' (0x{MetadataTokens.GetToken(oldAsmRef):X8}), " +
-                                    "which the reference policy dropped, so the type reference " +
-                                    "cannot be remapped. Either the source should not depend on " +
-                                    $"'{oldAsmName}', or pass a policy that keeps it — see " +
-                                    "ReferencePolicy.RetargetCoreLibOnly.");
-                            }
-                            newResolutionScope = newAsmRef;
-                        }
-                        break;
+                        newResolutionScope = facadeRef;
                     }
-
-                case HandleKind.TypeReference:
+                    else
                     {
-                        // Nested type - resolve through parent
-                        newResolutionScope = _typeRefMap[(TypeReferenceHandle)typeRef.ResolutionScope];
-                        break;
-                    }
-
-                case HandleKind.ModuleReference:
-                    {
-                        // A nil scope means "search the ExportedType table" (ECMA-335
-                        // II.22.38), which is a different lookup entirely — so map the
-                        // reference rather than dropping it.
-                        var oldModuleRef = (ModuleReferenceHandle)typeRef.ResolutionScope;
-                        if (!_moduleRefMap.TryGetValue(oldModuleRef, out var newModuleRef))
+                        // A dropped reference has no row, so this map can legitimately have no
+                        // entry. A bare indexer turned that into a KeyNotFoundException naming
+                        // neither the type nor the reference — matching the ModuleReference arm
+                        // below is the least a caller needs.
+                        if (!_assemblyRefMap.TryGetValue(oldAsmRef, out var newAsmRef))
                         {
                             throw new PEPackerException(
-                                $"Type reference '{fullName}' is scoped to module reference " +
-                                $"0x{MetadataTokens.GetToken(oldModuleRef):X8}, which was not copied.");
+                                $"Type reference '{fullName}' is scoped to assembly reference " +
+                                $"'{oldAsmName}' (0x{MetadataTokens.GetToken(oldAsmRef):X8}), " +
+                                "which the reference policy dropped, so the type reference " +
+                                "cannot be remapped. Either the source should not depend on " +
+                                $"'{oldAsmName}', or pass a policy that keeps it — see " +
+                                "ReferencePolicy.RetargetCoreLibOnly.");
                         }
-                        newResolutionScope = newModuleRef;
-                        break;
+                        newResolutionScope = newAsmRef;
                     }
-
-                case HandleKind.ModuleDefinition:
-                default:
-                    // Scoped to this module, or genuinely nil.
-                    newResolutionScope = default;
                     break;
-            }
+                }
 
-            var newHandle = _metadata.AddTypeReference(
-                newResolutionScope,
-                GetOrAddString(ns),
-                GetOrAddString(name));
+            case HandleKind.TypeReference:
+                {
+                    // Nested type — resolve through the parent, copying it first if its
+                    // row has not been reached yet.
+                    newResolutionScope = CopyTypeReference(
+                        (TypeReferenceHandle)typeRef.ResolutionScope, inProgress);
+                    break;
+                }
 
-            _typeRefMap[typeRefHandle] = newHandle;
+            case HandleKind.ModuleReference:
+                {
+                    // A nil scope means "search the ExportedType table" (ECMA-335
+                    // II.22.38), which is a different lookup entirely — so map the
+                    // reference rather than dropping it.
+                    var oldModuleRef = (ModuleReferenceHandle)typeRef.ResolutionScope;
+                    if (!_moduleRefMap.TryGetValue(oldModuleRef, out var newModuleRef))
+                    {
+                        throw new PEPackerException(
+                            $"Type reference '{fullName}' is scoped to module reference " +
+                            $"0x{MetadataTokens.GetToken(oldModuleRef):X8}, which was not copied.");
+                    }
+                    newResolutionScope = newModuleRef;
+                    break;
+                }
+
+            case HandleKind.ModuleDefinition:
+            default:
+                // Scoped to this module, or genuinely nil.
+                newResolutionScope = default;
+                break;
         }
+
+        var newHandle = _metadata.AddTypeReference(
+            newResolutionScope,
+            GetOrAddString(ns),
+            GetOrAddString(name));
+
+        _typeRefMap[typeRefHandle] = newHandle;
+        inProgress.Remove(typeRefHandle);
+        return newHandle;
     }
 
     private void CopyTypeSpecifications()

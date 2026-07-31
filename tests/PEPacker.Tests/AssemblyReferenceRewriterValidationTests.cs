@@ -3,9 +3,9 @@ using System.Reflection.Emit;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
 using System.Reflection.PortableExecutable;
-using System.Runtime.InteropServices;
 using PEPacker;
 using Xunit;
+using static PEPacker.Tests.Infrastructure.RewriterTestHelpers;
 
 namespace PEPacker.Tests;
 
@@ -164,27 +164,5 @@ public class AssemblyReferenceRewriterValidationTests
         var blob = new BlobBuilder();
         peBuilder.Serialize(blob);
         return blob.ToArray();
-    }
-
-    private static byte[] Build(string name, Action<ModuleBuilder> emit)
-    {
-        var ab = new PersistedAssemblyBuilder(new AssemblyName(name), typeof(object).Assembly);
-        emit(ab.DefineDynamicModule(name));
-
-        using var stream = new MemoryStream();
-        ab.Save(stream);
-        return stream.ToArray();
-    }
-
-    private static byte[] Rewrite(byte[] source)
-    {
-        using var rewriter = new AssemblyReferenceRewriter(
-            new MemoryStream(source), RuntimeEnvironment.GetRuntimeDirectory());
-
-        rewriter.Rewrite();
-
-        using var output = new MemoryStream();
-        rewriter.Save(output);
-        return output.ToArray();
     }
 }

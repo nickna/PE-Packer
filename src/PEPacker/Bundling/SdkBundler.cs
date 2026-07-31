@@ -43,6 +43,12 @@ public class SdkBundler : IBundler
         var assemblyName = request.AssemblyName;
         var rid = request.RuntimeIdentifier ?? ManualBundler.GetCurrentRuntimeIdentifier();
 
+        if (string.IsNullOrEmpty(dllPath) || !File.Exists(dllPath))
+        {
+            throw new PEPackerException(
+                $"BundleRequest.EntryAssemblyPath '{dllPath}' does not exist.");
+        }
+
         if (!request.Overwrite && File.Exists(exePath))
         {
             throw new PEPackerException(
@@ -65,9 +71,15 @@ public class SdkBundler : IBundler
             Directory.CreateDirectory(outputDir);
         }
 
-        // Create a temporary working directory for bundling
+        // Create a temporary working directory for bundling, plus a separate staging directory
+        // for the bundler's output. HostModel names its output after the host, so staging it in
+        // the caller's output directory clobbered any unrelated '{assemblyName}.exe' sitting
+        // there — including when BundleRequest.Overwrite was false, since that guard only ever
+        // looked at the requested output path.
         var tempBundleDir = Path.Combine(Path.GetTempPath(), $"pepacker_bundle_{Guid.NewGuid():N}");
+        var tempStageDir = Path.Combine(Path.GetTempPath(), $"pepacker_stage_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempBundleDir);
+        Directory.CreateDirectory(tempStageDir);
 
         try
         {
@@ -113,28 +125,44 @@ public class SdkBundler : IBundler
             File.WriteAllText(runtimeConfigPath, runtimeConfigContent);
 
             // Use the SDK Bundler via reflection
-            InvokeSdkBundler(apphostPath, exePath, assemblyName, tempBundleDir, additional,
-                request.FrameworkVersion, rid);
+            var bundlePath = InvokeSdkBundler(apphostPath, tempStageDir, assemblyName, tempBundleDir,
+                additional, request.FrameworkVersion, rid);
+
+            ManualBundler.MoveIntoPlace(bundlePath, exePath, request.Overwrite);
+            ManualBundler.SetExecutePermission(exePath);
 
             return new BundleResult(exePath, BundleTechnique.SdkBundler);
         }
         finally
         {
-            // Clean up temp directory
-            try
-            {
-                Directory.Delete(tempBundleDir, recursive: true);
-            }
-            catch
-            {
-                // Ignore cleanup errors
-            }
+            TryDeleteDirectory(tempBundleDir);
+            TryDeleteDirectory(tempStageDir);
+        }
+    }
+
+    private static void TryDeleteDirectory(string path)
+    {
+        try
+        {
+            Directory.Delete(path, recursive: true);
+        }
+        catch
+        {
+            // A leftover temp directory must not replace the result, successful or not.
         }
     }
 
     /// <summary>
-    /// Invokes the SDK Bundler via reflection.
+    /// Invokes the SDK Bundler via reflection, producing the bundle inside a staging directory.
     /// </summary>
+    /// <param name="apphostPath">Apphost template to patch.</param>
+    /// <param name="stagingDir">A directory owned by this call, where the bundle is produced.</param>
+    /// <param name="assemblyName">Managed assembly name without extension.</param>
+    /// <param name="sourceDir">The directory holding the files to bundle.</param>
+    /// <param name="additionalAssemblies">Extra assemblies, by file name within the source directory.</param>
+    /// <param name="frameworkVersion">Target framework version, or null for the running one.</param>
+    /// <param name="rid">Target runtime identifier.</param>
+    /// <returns>The path of the bundle inside <paramref name="stagingDir"/>.</returns>
     [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2026:RequiresUnreferencedCode",
         Justification =
             "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
@@ -151,7 +179,7 @@ public class SdkBundler : IBundler
             "ManualBundler instead, so this code is unreachable there. The reflection targets " +
             "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
             "part of this application's trimmed closure.")]
-    private void InvokeSdkBundler(string apphostPath, string outputPath, string assemblyName,
+    private string InvokeSdkBundler(string apphostPath, string stagingDir, string assemblyName,
         string sourceDir, List<string> additionalAssemblies, Version? frameworkVersion, string rid)
     {
         // First, patch the apphost template with the DLL name using HostWriter
@@ -176,109 +204,130 @@ public class SdkBundler : IBundler
         var effectiveVersion = frameworkVersion ?? Environment.Version;
         var targetFrameworkVersion = new Version(effectiveVersion.Major, effectiveVersion.Minor);
 
-        // Prepare output directory (must be different from source)
-        var tempOutputDir = Path.GetDirectoryName(outputPath);
-        if (string.IsNullOrEmpty(tempOutputDir))
+        // Construction is probed across the type's constructors, because HostModel's signature has
+        // changed between SDK versions. Only construction is probed: once an instance exists, a
+        // later failure is a bundling failure, and retrying it against the next constructor both
+        // repeated the work and reported it as "no compatible constructor", which is a diagnosis
+        // of the wrong problem with the real exception discarded.
+        var bundler = ConstructBundler(assemblyName, stagingDir, bundleOptionsNone, targetOS,
+            targetArch, targetFrameworkVersion, apphostPath);
+
+        try
         {
-            tempOutputDir = Directory.GetCurrentDirectory();
+            // Get FileSpec type and create file specs
+            var fileSpecType = _hostModelAssembly.GetType("Microsoft.NET.HostModel.Bundle.FileSpec")
+                ?? throw new PEPackerException("Could not find FileSpec type in SDK.");
+
+            var fileSpecs = CreateFileSpecList(fileSpecType, sourceDir, assemblyName,
+                patchedApphostPath, additionalAssemblies);
+
+            // Find and invoke GenerateBundle method
+            var generateBundleMethod = _bundlerType.GetMethod("GenerateBundle")
+                ?? throw new PEPackerException("Could not find GenerateBundle method in SDK Bundler.");
+
+            generateBundleMethod.Invoke(bundler, [fileSpecs]);
+        }
+        catch (Exception ex) when (ex is not PEPackerException)
+        {
+            var cause = Unwrap(ex);
+            throw new PEPackerException(
+                $"The SDK bundler failed while generating the bundle for '{rid}': {cause.Message}",
+                cause);
         }
 
-        // Try to find and invoke a compatible constructor
+        // The bundler names its output after the hostName argument, which is always
+        // "{assemblyName}.exe" — on Linux targets too, since it is a name rather than a platform
+        // convention. There is no extension-less variant to look for.
+        var producedPath = Path.Combine(stagingDir, $"{assemblyName}.exe");
+        if (!File.Exists(producedPath))
+        {
+            throw new PEPackerException(
+                $"The SDK bundler reported success but did not create '{producedPath}'.");
+        }
+
+        return producedPath;
+    }
+
+    /// <summary>
+    /// Finds a HostModel <c>Bundler</c> constructor this version of PEPacker can satisfy, and
+    /// invokes it.
+    /// </summary>
+    /// <exception cref="PEPackerException">No constructor could be satisfied or invoked.</exception>
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2070:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2080:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    [UnconditionalSuppressMessage("AssemblyLoadTrimming", "IL2075:DynamicallyAccessedMembers",
+        Justification =
+            "SdkBundler is constructed only when SdkBundlerDetector reports the SDK bundler " +
+            "available, which requires Assembly.LoadFrom to have succeeded. That is impossible " +
+            "under Native AOT, where detection returns unavailable and BundlerFactory selects " +
+            "ManualBundler instead, so this code is unreachable there. The reflection targets " +
+            "live in Microsoft.NET.HostModel.dll, loaded from the SDK on disk and therefore not " +
+            "part of this application's trimmed closure.")]
+    private object ConstructBundler(string assemblyName, string stagingDir, object bundleOptions,
+        OSPlatform targetOS, Architecture targetArch, Version targetFrameworkVersion, string apphostPath)
+    {
         var constructors = _bundlerType.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
 
         Exception? lastException = null;
+        string? lastFailure = null;
 
         foreach (var constructor in constructors.OrderByDescending(c => c.GetParameters().Length))
         {
             var parameters = constructor.GetParameters();
+            var args = BuildConstructorArgs(parameters, assemblyName, stagingDir, bundleOptions,
+                targetOS, targetArch, targetFrameworkVersion, apphostPath);
+
+            if (args is null)
+            {
+                lastFailure ??=
+                    $"the {parameters.Length}-parameter constructor takes a parameter type PEPacker " +
+                    "cannot supply";
+                continue;
+            }
 
             try
             {
-                var args = BuildConstructorArgs(parameters, assemblyName, tempOutputDir, bundleOptionsNone,
-                    targetOS, targetArch, targetFrameworkVersion, apphostPath);
-
-                if (args != null)
-                {
-                    var bundler = constructor.Invoke(args);
-
-                    // Get FileSpec type and create file specs
-                    var fileSpecType = _hostModelAssembly.GetType("Microsoft.NET.HostModel.Bundle.FileSpec");
-                    if (fileSpecType == null)
-                    {
-                        throw new PEPackerException("Could not find FileSpec type in SDK.");
-                    }
-
-                    var fileSpecs = CreateFileSpecList(fileSpecType, sourceDir, assemblyName,
-                        patchedApphostPath, additionalAssemblies);
-
-                    // Find and invoke GenerateBundle method
-                    var generateBundleMethod = _bundlerType.GetMethod("GenerateBundle");
-                    if (generateBundleMethod == null)
-                    {
-                        throw new PEPackerException("Could not find GenerateBundle method in SDK Bundler.");
-                    }
-
-                    generateBundleMethod.Invoke(bundler, [fileSpecs]);
-
-                    // The SDK bundler creates the file in outputDir with name from hostName parameter
-                    // hostName we passed was "{assemblyName}.exe"
-                    var expectedExeName = $"{assemblyName}.exe";
-                    var actualOutputPath = Path.Combine(tempOutputDir, expectedExeName);
-
-                    // Move/copy to final output path if different
-                    if (File.Exists(actualOutputPath))
-                    {
-                        // Normalize both paths to compare properly (handles relative vs absolute)
-                        var normalizedActual = Path.GetFullPath(actualOutputPath);
-                        var normalizedOutput = Path.GetFullPath(outputPath);
-
-                        if (!string.Equals(normalizedActual, normalizedOutput, StringComparison.OrdinalIgnoreCase))
-                        {
-                            // Actually different paths - move the file
-                            if (File.Exists(outputPath))
-                            {
-                                File.Delete(outputPath);
-                            }
-                            File.Move(actualOutputPath, outputPath);
-                        }
-                        // If same path, file is already in the right place
-                        ManualBundler.SetExecutePermission(outputPath);
-                        return; // Success!
-                    }
-
-                    // Also check for non-Windows name (no .exe extension)
-                    var altOutputPath = Path.Combine(tempOutputDir, assemblyName);
-                    if (File.Exists(altOutputPath))
-                    {
-                        var normalizedAlt = Path.GetFullPath(altOutputPath);
-                        var normalizedOutput = Path.GetFullPath(outputPath);
-
-                        if (!string.Equals(normalizedAlt, normalizedOutput, StringComparison.OrdinalIgnoreCase))
-                        {
-                            if (File.Exists(outputPath))
-                            {
-                                File.Delete(outputPath);
-                            }
-                            File.Move(altOutputPath, outputPath);
-                        }
-                        ManualBundler.SetExecutePermission(outputPath);
-                        return; // Success!
-                    }
-
-                    throw new PEPackerException($"SDK Bundler did not create expected output file at {actualOutputPath}");
-                }
+                return constructor.Invoke(args);
             }
             catch (Exception ex)
             {
-                // Unwrap TargetInvocationException to get the real error
-                lastException = ex is System.Reflection.TargetInvocationException tie ? tie.InnerException ?? ex : ex;
-                // Continue trying other constructors
+                // Unwrap TargetInvocationException to get the real error, then try the next
+                // constructor: an argument this version rejects is exactly what probing is for.
+                lastException = Unwrap(ex);
+                lastFailure = lastException.Message;
             }
         }
 
-        throw new PEPackerException(
-            $"Could not find compatible Bundler constructor in SDK. Last error: {lastException?.Message}");
+        var message =
+            "Could not construct the SDK Bundler from Microsoft.NET.HostModel: " +
+            (lastFailure ?? "the type exposes no public instance constructor") + ".";
+
+        throw lastException is null
+            ? new PEPackerException(message)
+            : new PEPackerException(message, lastException);
     }
+
+    /// <summary>
+    /// Unwraps the reflection wrapper so the reported failure is the one that actually happened.
+    /// </summary>
+    private static Exception Unwrap(Exception exception) =>
+        exception is TargetInvocationException tie && tie.InnerException is not null
+            ? tie.InnerException
+            : exception;
 
     /// <summary>
     /// Builds constructor arguments based on parameter types.
@@ -312,7 +361,9 @@ public class SdkBundler : IBundler
                     // The bundler uses this to compute file names like "{appAssemblyName}.runtimeconfig.json"
                     args[i] = assemblyName;
                 }
-                else if (paramName.Contains("apphost") || paramName.Contains("source"))
+                else if (IsAppHostSourceParameter(paramName)
+                    || (paramName.Contains("apphost", StringComparison.Ordinal)
+                        && !paramName.Contains("destination", StringComparison.Ordinal)))
                 {
                     args[i] = apphostPath;
                 }
@@ -340,8 +391,13 @@ public class SdkBundler : IBundler
             }
             else if (paramType == typeof(bool))
             {
-                // diagnosticOutput or macosCodesign - both false
-                args[i] = false;
+                // Matched by name rather than forced to false. HostModel's macosCodesign
+                // parameter defaults to true, and ad-hoc signing is the entire reason the
+                // built-in bundler's macOS refusal tells callers to use BundlerMode.Sdk — an
+                // arm64 macOS binary that is not signed will not launch. Passing false there
+                // silently produced exactly the executable that refusal exists to avoid.
+                // Everything else (diagnosticOutput) stays off.
+                args[i] = paramName.Contains("sign", StringComparison.Ordinal);
             }
             else if (Nullable.GetUnderlyingType(paramType) != null)
             {
@@ -505,15 +561,23 @@ public class SdkBundler : IBundler
             var paramName = param.Name?.ToLowerInvariant() ?? "";
             var paramType = param.ParameterType;
 
-            if (paramName.Contains("source") || i == 0)
+            // Every name match is guarded by the parameter type. Without that guard the
+            // precedence of `a || b && c` on the third branch was the only thing keeping a bool
+            // parameter whose name contains "app" from being handed a string — it happened to
+            // bind correctly, which is not the same as being correct.
+            if (paramType == typeof(string) && (IsAppHostSourceParameter(paramName) || i == 0))
             {
                 args[i] = apphostSourcePath;
             }
-            else if (paramName.Contains("destination") || i == 1)
+            else if (paramType == typeof(string)
+                && (paramName.Contains("destination", StringComparison.Ordinal) || i == 1))
             {
                 args[i] = apphostDestPath;
             }
-            else if (paramName.Contains("binary") || paramName.Contains("app") && paramType == typeof(string))
+            else if (paramType == typeof(string)
+                && (paramName.Contains("binary", StringComparison.Ordinal)
+                    || (paramName.Contains("app", StringComparison.Ordinal)
+                        && !paramName.Contains("apphost", StringComparison.Ordinal))))
             {
                 args[i] = appBinaryName;
             }
@@ -539,6 +603,43 @@ public class SdkBundler : IBundler
             }
         }
 
-        createAppHostMethod.Invoke(null, args);
+        try
+        {
+            createAppHostMethod.Invoke(null, args);
+        }
+        catch (Exception ex)
+        {
+            var cause = Unwrap(ex);
+            throw new PEPackerException(
+                $"HostWriter.CreateAppHost failed for '{apphostSourcePath}': {cause.Message}", cause);
+        }
+    }
+
+    /// <summary>
+    /// Identifies the parameter that takes the apphost template path.
+    /// </summary>
+    /// <param name="lowerCaseParameterName">The parameter's name, lower-cased.</param>
+    /// <remarks>
+    /// Matching bare "source" is not safe here. HostModel's <c>CreateAppHost</c> also takes
+    /// <c>assemblyToCopyResorcesFrom</c> — the typo is theirs — and the obvious corrected
+    /// spelling, <c>assemblyToCopyResourcesFrom</c>, contains "source". A rename that fixes their
+    /// typo would silently start passing the apphost template as the resource donor, so the
+    /// resource-shaped names are excluded explicitly and the specific
+    /// <c>appHostSource…</c> spelling is matched first.
+    /// </remarks>
+    private static bool IsAppHostSourceParameter(string lowerCaseParameterName)
+    {
+        if (lowerCaseParameterName.Contains("apphostsource", StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (lowerCaseParameterName.Contains("resource", StringComparison.Ordinal)
+            || lowerCaseParameterName.Contains("resorce", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return lowerCaseParameterName.Contains("source", StringComparison.Ordinal);
     }
 }
