@@ -112,4 +112,35 @@ public class RuntimeConfigTests
         Assert.Equal("Microsoft.NETCore.App", framework.GetProperty("name").GetString());
         Assert.Equal("10.0.0", framework.GetProperty("version").GetString());
     }
+
+    [Fact]
+    public void Generate_EmitsTypedConfigProperties()
+    {
+        var json = RuntimeConfig.Generate(
+            new Version(10, 0),
+            configProperties: new Dictionary<string, object?>
+            {
+                ["System.GC.Server"] = true,
+                ["System.GC.DynamicAdaptationMode"] = 1,
+                ["probe.name"] = "adaptive",
+                ["probe.null"] = null,
+            });
+
+        using var doc = System.Text.Json.JsonDocument.Parse(json);
+        var properties = doc.RootElement.GetProperty("runtimeOptions").GetProperty("configProperties");
+        Assert.True(properties.GetProperty("System.GC.Server").GetBoolean());
+        Assert.Equal(1, properties.GetProperty("System.GC.DynamicAdaptationMode").GetInt32());
+        Assert.Equal("adaptive", properties.GetProperty("probe.name").GetString());
+        Assert.Equal(System.Text.Json.JsonValueKind.Null, properties.GetProperty("probe.null").ValueKind);
+    }
+
+    [Fact]
+    public void Generate_RejectsUnsupportedConfigPropertyValues()
+    {
+        var ex = Assert.Throws<PEPackerException>(() => RuntimeConfig.Generate(
+            configProperties: new Dictionary<string, object?> { ["nested"] = new object() }));
+
+        Assert.Contains("nested", ex.Message);
+        Assert.Contains("JSON primitive", ex.Message);
+    }
 }

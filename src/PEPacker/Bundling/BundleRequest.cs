@@ -67,6 +67,18 @@ public sealed record BundleRequest
     public RollForwardPolicy RollForward { get; init; } = RollForwardPolicy.LatestMinor;
 
     /// <summary>
+    /// Runtime host settings written under <c>runtimeOptions.configProperties</c> in the
+    /// bundled <c>runtimeconfig.json</c>.
+    /// </summary>
+    /// <remarks>
+    /// Values may be JSON primitives (<see cref="bool"/>, integral and floating-point numeric
+    /// types, <see cref="string"/>, or <see langword="null"/>). This is deployment policy such
+    /// as <c>System.GC.Server</c>; it does not change the managed assembly being bundled.
+    /// </remarks>
+    public IReadOnlyDictionary<string, object?> RuntimeConfigProperties { get; init; }
+        = new Dictionary<string, object?>();
+
+    /// <summary>
     /// An explicit apphost template to patch. When null, PEPacker uses its embedded
     /// template for supported Windows/Linux RIDs, then falls back to an installed
     /// <c>Microsoft.NETCore.App.Host.&lt;rid&gt;</c> pack.

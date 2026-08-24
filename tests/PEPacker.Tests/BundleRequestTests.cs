@@ -213,6 +213,32 @@ public class BundleRequestTests : IDisposable
         Assert.Contains("\"tfm\": \"net9.3\"", text);
     }
 
+    [Fact]
+    public void RuntimeConfigProperties_ReachTheBuiltInBundle()
+    {
+        var apphost = RequireAppHost();
+
+        var libPath = EmitLibrary("ProbeLib");
+        var exePath = Path.Combine(_work, "properties", "ProbeLib" + ExeSuffix);
+
+        new ManualBundler().CreateSingleFileExecutable(new BundleRequest
+        {
+            EntryAssemblyPath = libPath,
+            OutputPath = exePath,
+            AssemblyName = "ProbeLib",
+            AppHostTemplatePath = apphost,
+            RuntimeConfigProperties = new Dictionary<string, object?>
+            {
+                ["System.GC.Server"] = true,
+                ["System.GC.DynamicAdaptationMode"] = 1,
+            },
+        });
+
+        var text = System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(exePath));
+        Assert.Contains("\"System.GC.Server\": true", text);
+        Assert.Contains("\"System.GC.DynamicAdaptationMode\": 1", text);
+    }
+
     /// <summary>
     /// Every embedded assembly must start on a page boundary, since they are memory-mapped from
     /// the bundle. Only the first used to be aligned, which was invisible while exactly one was

@@ -50,11 +50,17 @@ public class SdkBundlerStagingTests : IDisposable
             EntryAssemblyPath = entryAssembly,
             OutputPath = Path.Combine(outputDir, "Bundled.exe"),
             AssemblyName = "Probe",
+            RuntimeConfigProperties = new Dictionary<string, object?>
+            {
+                ["System.GC.Server"] = true,
+            },
         });
 
         Assert.True(File.Exists(result.OutputPath), "the SDK bundler produced no output");
         Assert.True(new FileInfo(result.OutputPath).Length > new FileInfo(entryAssembly).Length,
             "the output is smaller than the assembly it bundles, so nothing was bundled");
+        Assert.Contains("\"System.GC.Server\": true",
+            System.Text.Encoding.UTF8.GetString(File.ReadAllBytes(result.OutputPath)));
         Assert.Equal("DO-NOT-CLOBBER", File.ReadAllText(bystander));
     }
 
