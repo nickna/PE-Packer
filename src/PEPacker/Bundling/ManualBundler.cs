@@ -87,7 +87,8 @@ public class ManualBundler : IBundler
         }
 
         var runtimeConfigBytes = Encoding.UTF8.GetBytes(
-            RuntimeConfig.Generate(request.FrameworkVersion, request.RollForward));
+            RuntimeConfig.Generate(request.FrameworkVersion, request.RollForward,
+                request.RuntimeConfigProperties));
 
         var outputDir = Path.GetDirectoryName(Path.GetFullPath(request.OutputPath));
         if (!string.IsNullOrEmpty(outputDir) && !Directory.Exists(outputDir))

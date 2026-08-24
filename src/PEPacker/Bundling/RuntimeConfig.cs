@@ -1,3 +1,7 @@
+using System.Buffers;
+using System.Text;
+using System.Text.Json;
+
 namespace PEPacker.Bundling;
 
 /// <summary>
@@ -62,26 +66,76 @@ internal static class RuntimeConfig
     /// used.
     /// </param>
     /// <param name="rollForward">Roll-forward policy to record.</param>
+    /// <param name="configProperties">
+    /// Optional runtime host settings to write under <c>runtimeOptions.configProperties</c>.
+    /// </param>
     internal static string Generate(
         Version? frameworkVersion = null,
-        RollForwardPolicy rollForward = RollForwardPolicy.LatestMinor)
+        RollForwardPolicy rollForward = RollForwardPolicy.LatestMinor,
+        IReadOnlyDictionary<string, object?>? configProperties = null)
     {
         var version = frameworkVersion ?? Environment.Version;
         int major = version.Major;
         int minor = version.Minor < 0 ? 0 : version.Minor;
 
-        return $$"""
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+            writer.WriteStartObject("runtimeOptions");
+            writer.WriteString("tfm", $"net{major}.{minor}");
+            writer.WriteString("rollForward", ToJsonValue(rollForward));
+            writer.WriteStartObject("framework");
+            writer.WriteString("name", "Microsoft.NETCore.App");
+            writer.WriteString("version", $"{major}.{minor}.0");
+            writer.WriteEndObject();
+
+            if (configProperties is { Count: > 0 })
             {
-              "runtimeOptions": {
-                "tfm": "net{{major}}.{{minor}}",
-                "rollForward": "{{ToJsonValue(rollForward)}}",
-                "framework": {
-                  "name": "Microsoft.NETCore.App",
-                  "version": "{{major}}.{{minor}}.0"
+                writer.WriteStartObject("configProperties");
+                foreach (var (name, value) in configProperties.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+                {
+                    if (string.IsNullOrEmpty(name))
+                    {
+                        throw new PEPackerException(
+                            "RuntimeConfigProperties cannot contain an empty property name.");
+                    }
+
+                    WriteConfigProperty(writer, name, value);
                 }
-              }
+                writer.WriteEndObject();
             }
-            """;
+
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.WrittenSpan);
+    }
+
+    private static void WriteConfigProperty(Utf8JsonWriter writer, string name, object? value)
+    {
+        switch (value)
+        {
+            case null: writer.WriteNull(name); break;
+            case bool typed: writer.WriteBoolean(name, typed); break;
+            case string typed: writer.WriteString(name, typed); break;
+            case byte typed: writer.WriteNumber(name, typed); break;
+            case sbyte typed: writer.WriteNumber(name, typed); break;
+            case short typed: writer.WriteNumber(name, typed); break;
+            case ushort typed: writer.WriteNumber(name, typed); break;
+            case int typed: writer.WriteNumber(name, typed); break;
+            case uint typed: writer.WriteNumber(name, typed); break;
+            case long typed: writer.WriteNumber(name, typed); break;
+            case ulong typed: writer.WriteNumber(name, typed); break;
+            case float typed: writer.WriteNumber(name, typed); break;
+            case double typed: writer.WriteNumber(name, typed); break;
+            case decimal typed: writer.WriteNumber(name, typed); break;
+            default:
+                throw new PEPackerException(
+                    $"RuntimeConfigProperties['{name}'] has unsupported value type " +
+                    $"'{value.GetType().FullName}'. Use a JSON primitive value.");
+        }
     }
 
     /// <summary>

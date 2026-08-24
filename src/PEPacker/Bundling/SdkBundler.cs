@@ -120,7 +120,8 @@ public class SdkBundler : IBundler
 
             // Generate runtimeconfig.json. The apphost pack version describes the PE stub, not
             // the framework the bundle needs, so it plays no part here.
-            var runtimeConfigContent = RuntimeConfig.Generate(request.FrameworkVersion, request.RollForward);
+            var runtimeConfigContent = RuntimeConfig.Generate(request.FrameworkVersion,
+                request.RollForward, request.RuntimeConfigProperties);
             var runtimeConfigPath = Path.Combine(tempBundleDir, $"{assemblyName}.runtimeconfig.json");
             File.WriteAllText(runtimeConfigPath, runtimeConfigContent);
 
