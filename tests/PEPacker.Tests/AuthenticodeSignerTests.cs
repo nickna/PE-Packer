@@ -33,7 +33,7 @@ public class AuthenticodeSignerTests
         var invocation = CreateInvocation("original.exe", "signed.exe", options, new("osslsigncode", ToolKind.OsslSignCode));
         Assert.Equal("secret", invocation.StandardInput);
         Assert.DoesNotContain("secret", invocation.StartInfo.ArgumentList);
-        Assert.Equal(new[] { "sign", "-h", "sha256", "-pkcs12", Path.GetFullPath("test.pfx"), "-readpass", "-",
+        Assert.Equal(new[] { "sign", "-h", "sha256", "-pkcs12", Path.GetFullPath("test.pfx"), "-readpass", "/dev/stdin",
             "-ts", AuthenticodeSigningOptions.DefaultTimestampUrl, "-in", "original.exe", "-out", "signed.exe" }, invocation.StartInfo.ArgumentList);
     }
 

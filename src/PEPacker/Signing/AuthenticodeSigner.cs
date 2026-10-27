@@ -133,8 +133,9 @@ public static class AuthenticodeSigner
         }
         else
         {
-            Add("-h", digest, "-pkcs12", Path.GetFullPath(options.Certificate), "-readpass", "-");
+            Add("-h", digest, "-pkcs12", Path.GetFullPath(options.Certificate), "-readpass", "/dev/stdin");
             // Send the PKCS#12 password over stdin rather than exposing it in process arguments.
+            // Older packaged osslsigncode versions treat '-' as a literal filename.
             input = options.Password ?? "";
             if (options.TimestampUrl is { } timestamp) Add("-ts", timestamp);
             Add("-in", original, "-out", staged);
