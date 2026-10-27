@@ -1,0 +1,40 @@
+name: Authenticode signing smoke
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  signed-bundle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Install independent signature verifier
+        run: sudo apt-get update && sudo apt-get install -y osslsigncode openssl
+      - name: Sign and verify a Windows single-file bundle
+        shell: bash
+        env:
+          PEPACKER_SIGNING_SMOKE_PASSWORD: ephemeral-fixture
+        run: |
+          set -euo pipefail
+          scratch="$(mktemp -d)"
+          trap 'rm -rf "$scratch"' EXIT
+          # File-only, one-day test certificate. No OS trust store is modified.
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+            -keyout "$scratch/key.pem" -out "$scratch/cert.pem" -days 1 \
+            -subj '/CN=PE-Packer ephemeral signing test' \
+            -addext 'extendedKeyUsage=codeSigning' -addext 'keyUsage=digitalSignature'
+          openssl pkcs12 -export -inkey "$scratch/key.pem" -in "$scratch/cert.pem" \
+            -out "$scratch/test.pfx" -passout env:PEPACKER_SIGNING_SMOKE_PASSWORD
+          dotnet run --project tests/PEPacker.SigningSmoke -c Release -- \
+            "$scratch/test.pfx" "$scratch/signed.exe"
+          osslsigncode verify -CAfile "$scratch/cert.pem" -in "$scratch/signed.exe"
