@@ -30,6 +30,42 @@ Anything that emits assemblies at runtime and needs to ship them. The motivating
 - **App Host Generation** — Generates standalone executable wrappers around .NET DLLs with proper runtime configuration.
 - **Native AOT support** — The library runs inside Native AOT-published applications, verified end to end on linux-x64 in CI and manually on win-arm64. A feature switch lets AOT consumers compile out the SDK-bundler path entirely.
 
+## Opt-in Authenticode signing
+
+Sign the final Windows PE file after bundling:
+
+```csharp
+using PEPacker.Signing;
+
+await AuthenticodeSigner.SignAsync("hello.exe", new AuthenticodeSigningOptions
+{
+    Certificate = "code-signing.pfx",
+    Password = Environment.GetEnvironmentVariable("SIGNING_PASSWORD")
+});
+```
+
+Signing defaults to SHA-256 and the DigiCert RFC 3161 timestamp endpoint. Set
+`TimestampUrl` to another HTTP(S) endpoint, or to `null` for offline development
+tests. `DigestAlgorithm` also supports `sha384` and `sha512`. On Windows,
+`Certificate = "sha1:<40 hexadecimal digits>"` selects a certificate already in
+the current user's `My` store. The library never imports certificates or changes
+trust stores.
+
+Windows uses `signtool.exe` from PATH, the Windows SDK, or SDK tools; other
+platforms use `osslsigncode` from PATH. `ToolPath` can select an explicit tool.
+See [Microsoft's SignTool documentation](https://learn.microsoft.com/windows/win32/seccrypto/signtool)
+and [osslsigncode installation instructions](https://github.com/mtrojnar/osslsigncode).
+Authenticode applies to Windows PE files, including Windows bundles produced on
+another host; ELF and Mach-O bundles require their platforms' signing mechanisms.
+
+The tool signs a staging file in the output directory. Only a successful tool
+exit replaces the original; errors, timeout, and cancellation preserve it and
+remove staging files. Tool diagnostics redact the password. Windows SignTool
+requires the PFX password as a process argument; osslsigncode receives it on stdin.
+The CI signing smoke creates a one-day file-only test certificate, signs a real
+Windows single-file bundle on Linux, and independently verifies it using
+`osslsigncode verify -CAfile`; no machine trust store is modified.
+
 ## Requirements
 
 - **.NET 10** — the package targets `net10.0`.
